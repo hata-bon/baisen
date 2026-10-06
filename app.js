@@ -5,17 +5,29 @@ const STORE_KEY = 'baisen-v1';
 
 const PROCESSES = ['ウォッシュド', 'ナチュラル', 'ハニー', 'スマトラ式', 'その他'];
 
-// 減り率（%）→ 焙煎度の名前の目安。「この値より下ならこの名前」
+// 減り率（%）→ 焙煎度の名前の目安。「この値より下ならこの名前」。たかさんにもらった一般的な表（2026/10/7）
 const ROAST_LEVELS = [
-  [12, 'ライト'],
-  [13.5, 'シナモン'],
+  [13, 'ライト'],
+  [14, 'シナモン'],
   [15, 'ミディアム'],
-  [16.5, 'ハイ'],
+  [16, 'ハイ'],
   [18, 'シティ'],
-  [19.5, 'フルシティ'],
-  [21.5, 'フレンチ'],
+  [19, 'フルシティ'],
+  [21, 'フレンチ'],
   [Infinity, 'イタリアン'],
 ];
+
+// 焙煎度ごとの減り率の目安・呼び方・味わいの傾向
+const ROAST_INFO = {
+  ライト: { range: '11〜13%', depth: '極浅煎り', taste: '穀物っぽさが残る、酸味が強い' },
+  シナモン: { range: '13〜14%', depth: '浅煎り', taste: 'すっきりした酸味' },
+  ミディアム: { range: '14〜15%', depth: '中浅煎り', taste: '酸味がやわらぎ、香りが出てくる' },
+  ハイ: { range: '15〜16%', depth: '中煎り', taste: '酸味と甘みのバランスがよい' },
+  シティ: { range: '16〜18%', depth: '中深煎り', taste: '苦みとコクが出てくる、人気の焙煎度' },
+  フルシティ: { range: '18〜19%', depth: '深煎り', taste: 'しっかりした苦みとコク' },
+  フレンチ: { range: '19〜21%', depth: '極深煎り', taste: '力強い苦み、カフェオレ向き' },
+  イタリアン: { range: '21〜23%', depth: '最深煎り', taste: '強い苦みとスモーキーさ' },
+};
 
 // 過去の記録の豆。seed.js の bean と対応
 const SEED_BEANS = {
@@ -281,12 +293,7 @@ function pastRoasts(r) {
 }
 
 function lossRange(level) {
-  const i = ROAST_LEVELS.findIndex(([, n]) => n === level);
-  if (i < 0) return '';
-  const lo = i ? ROAST_LEVELS[i - 1][0] : null, hi = ROAST_LEVELS[i][0];
-  if (lo == null) return `${hi}%未満`;
-  if (hi === Infinity) return `${lo}%以上`;
-  return `${lo}〜${hi}%`;
+  return ROAST_INFO[level]?.range || '';
 }
 
 function average(list) {
@@ -485,12 +492,15 @@ function showRoast(id) {
       ...(r.imported
         ? [['ノートの焙煎度', esc(r.noteLevel || '―')], ['ノートの減り率', esc(r.noteLoss || '―')]]
         : [['焙煎度（自分の判断）', esc(r.level || '―')]]),
-      ['減り率', lossRate(r) == null ? '―' : `${lossRate(r).toFixed(1)}%（目安は「${roastLevel(lossRate(r))}」）`],
+      ['減り率', lossRate(r) == null ? '―' : `${lossRate(r).toFixed(1)}%（目安は「${roastLevel(lossRate(r))}」${ROAST_INFO[roastLevel(lossRate(r))].depth}）<div class="hint">${ROAST_INFO[roastLevel(lossRate(r))].taste}</div>`],
       opt('豆の色', esc(r.color)),
       opt('ムラ・チャフ', esc(r.unevenness)),
       ['メモ', esc(r.memo || '―')],
     ])}</div>
+    <h2>焙煎後の豆の写真</h2>
+    <div class="card" id="photoBox"></div>
     ${tastingsHtml(r)}
+    ${aiReviewHtml(r)}
     <button class="btn primary" id="editRoast">この焙煎カードを直す</button>`;
 
   if (r.imported) {
@@ -499,6 +509,15 @@ function showRoast(id) {
   main.innerHTML = html;
   main.querySelector('#editRoast').addEventListener('click', () => editRoast(r.id));
   main.querySelector('#addTasting').addEventListener('click', () => editTasting(r.id));
+  renderPhotos(r, main.querySelector('#photoBox'));
+  main.querySelector('#askAi').addEventListener('click', () => askAi(r));
+  main.querySelector('#saveAi').addEventListener('click', () => {
+    const text = main.querySelector('#aiText').value.trim();
+    r.aiReview = text ? { text, date: todayIso() } : null;
+    save();
+    toast(text ? 'AIの評価を保存しました' : 'AIの評価を消しました');
+    showRoast(r.id);
+  });
   main.querySelectorAll('[data-tasting]').forEach(el => {
     el.addEventListener('click', () => editTasting(r.id, el.dataset.tasting));
   });
@@ -543,6 +562,214 @@ function parseVoiceTemp(text) {
     return temp != null ? { minute: null, temp } : null;
   }
   return null;
+}
+
+// ---------- 写真（このスマホの中の IndexedDB に保存） ----------
+// localStorage は小さいので、写真だけ別の置き場所に入れる。焙煎カードには写真の id だけを持たせる
+
+const PHOTO_DB = 'baisen-photos';
+let photoDbPromise = null;
+
+function photoDb() {
+  if (!photoDbPromise) {
+    photoDbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(PHOTO_DB, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore('photos', { keyPath: 'id' });
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  return photoDbPromise;
+}
+
+async function photoTx(mode, fn) {
+  const db = await photoDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('photos', mode);
+    const result = fn(tx.objectStore('photos'));
+    tx.oncomplete = () => resolve(result instanceof IDBRequest ? result.result : result);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+const putPhoto = photo => photoTx('readwrite', s => s.put(photo));
+const deletePhoto = id => photoTx('readwrite', s => s.delete(id));
+const getPhoto = id => photoTx('readonly', s => s.get(id));
+const allPhotos = () => photoTx('readonly', s => s.getAll());
+
+// 撮った写真を長い辺1200pxのJPEGに小さくする（1枚200KBほど）
+function shrinkImage(file, maxSide = 1200) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL('image/jpeg', 0.82));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('画像を読めませんでした')); };
+    img.src = url;
+  });
+}
+
+function dataUrlToFile(dataUrl, name) {
+  const [head, body] = dataUrl.split(',');
+  const bin = atob(body);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new File([bytes], name, { type: head.match(/:(.*?);/)[1] });
+}
+
+// 写真の並び。押すと大きく、×で消す
+async function renderPhotos(r, box) {
+  const ids = r.photoIds || [];
+  const photos = (await Promise.all(ids.map(getPhoto))).filter(Boolean);
+  box.innerHTML = `
+    <div class="photos">
+      ${photos.map(p => `
+        <div class="photo">
+          <img src="${p.dataUrl}" data-big="${p.id}" alt="焙煎後の豆の写真">
+          <button type="button" class="x" data-del="${p.id}" aria-label="この写真を消す">×</button>
+        </div>`).join('')}
+      <label class="photo add">📷<span>写真を追加</span>
+        <input type="file" accept="image/*" multiple hidden></label>
+    </div>`;
+
+  box.querySelector('input[type=file]').addEventListener('change', async e => {
+    const files = [...e.target.files];
+    if (!files.length) return;
+    toast('写真を保存しています…');
+    for (const file of files) {
+      try {
+        const photo = { id: newId(), roastId: r.id, date: todayIso(), dataUrl: await shrinkImage(file) };
+        await putPhoto(photo);
+        r.photoIds = [...(r.photoIds || []), photo.id];
+      } catch (err) {
+        toast('保存できない写真がありました');
+      }
+    }
+    save();
+    renderPhotos(r, box);
+  });
+
+  box.querySelectorAll('[data-del]').forEach(btn => btn.addEventListener('click', async () => {
+    if (!confirm('この写真を消しますか？')) return;
+    await deletePhoto(btn.dataset.del);
+    r.photoIds = r.photoIds.filter(id => id !== btn.dataset.del);
+    save();
+    renderPhotos(r, box);
+  }));
+
+  box.querySelectorAll('[data-big]').forEach(img => img.addEventListener('click', () => {
+    const view = document.createElement('div');
+    view.className = 'photo-view';
+    view.innerHTML = `<img src="${img.src}" alt=""><div class="hint">画面を押すと閉じます</div>`;
+    view.addEventListener('click', () => view.remove());
+    document.body.appendChild(view);
+  }));
+}
+
+// どの焙煎カードにも入っていない写真を片づける（焙煎カードを消したときなど）
+async function cleanupPhotos() {
+  try {
+    const used = new Set(data.roasts.flatMap(r => r.photoIds || []));
+    for (const p of await allPhotos()) if (!used.has(p.id)) await deletePhoto(p.id);
+  } catch (e) { /* 片づけられなくても使える */ }
+}
+
+// ---------- AIに評価してもらう（Claudeアプリに渡す） ----------
+
+function aiPrompt(r) {
+  const bean = data.beans.find(b => b.id === r.beanId) || {};
+  const loss = lossRate(r), rt = ratio(r);
+  const plan = targetPlan(r);
+  const line = (k, v) => (v == null || v === '' ? '' : `- ${k}：${v}\n`);
+  const ev = e => (e && (e.sec != null || e.temp != null || e.text) ? fmtEvent(e).replace(/<[^>]+>/g, '') : '');
+  const temps = (r.temps || []).map((t, i) => (t == null ? null : `${i}分 ${t}℃`)).filter(Boolean).join('、');
+  const past = pastRoasts(r).slice(0, 3).map(x => {
+    const l = lossRate(x);
+    const fc = x.firstCrack?.sec != null ? `1ハゼ${fmtTime(x.firstCrack.sec)}` : '';
+    const dr = x.drop?.sec != null ? `煎り止め${fmtTime(x.drop.sec)}` : '';
+    const taste = latestTasting(x);
+    return `- ${x.date}：減り率${l == null ? '―' : l.toFixed(1) + '%'}（${x.level || x.noteLevel || roastLevel(l) || '―'}）${[fc, dr].filter(Boolean).join('・')}${taste?.total ? `・味見の総合${taste.total}/5` : ''}${x.memo ? `・メモ「${x.memo}」` : ''}`;
+  }).join('\n');
+  const tastings = (r.tastings || []).map(t => {
+    const scores = TASTE_ITEMS.map(([k, label]) => (t[k] ? `${label}${t[k]}` : '')).filter(Boolean).join('・');
+    return `- ${t.date}（焙煎から${daysAfter(r.date, t.date)}日目）${brewText(t).replace(/<[^>]+>/g, '')}／${scores}／総合${t.total || '―'}/5${t.memo ? `／「${t.memo}」` : ''}`;
+  }).join('\n');
+
+  return `あなたはコーヒー焙煎にくわしい先生です。下の焙煎記録と、添付した焙煎後の豆の写真を見て、今回の焙煎を評価してください。
+焙煎機は IRUBO（カセットコンロの直火 × USBで自動回転するカゴ、デジタル温度計つき、1回100〜400g）です。温度は IRUBO の温度計の表示で、豆そのものの温度より低めに出ます。
+
+答えてほしいこと：
+1. 総合評価（10点満点）とひとこと
+2. よかった点
+3. 気になる点（温度の上がり方、1ハゼまでの時間、1ハゼから煎り止めまでの時間、減り率と写真の見た目の焙煎度が合っているか、写真から見えるムラ・焦げ・チップ・チャフなど）
+4. 次回の具体的な改善案（火力・回転速度・投入温度・煎り止めのタイミングなど）
+5. おすすめの飲みごろ（焙煎から何日目ごろ）と淹れ方
+専門用語には一言で説明を添えて、わかりやすく答えてください。
+
+【生豆】
+${line('名前', bean.name)}${line('産地', [bean.country, bean.region, bean.farm].filter(Boolean).join(' '))}${line('品種', bean.variety)}${line('等級', bean.grade)}${line('精製方法', bean.process)}${line('メモ', bean.memo)}
+【焙煎の前】
+${line('焙煎日', r.date)}${line('ロット', r.lot)}${line('投入量', r.inG != null ? `${r.inG}g` : '')}${line('ハンドピックで除いた量', r.pickBeforeG != null ? `${r.pickBeforeG}g` : '')}${line('目指した焙煎度', r.targetLevel)}${line('予熱して投入', r.preheat ? `あり${r.chargeTemp != null ? `（投入温度${r.chargeTemp}℃）` : ''}` : 'なし')}${line('気温・天気', [r.airTemp != null ? `${r.airTemp}℃` : '', r.weather].filter(Boolean).join('・'))}${plan ? line('目標', `1ハゼ ${fmtTime(plan.fc.sec)}・${plan.fc.temp}℃ → 煎り止め ${fmtTime(plan.drop.sec)}・${plan.drop.temp}℃`) : ''}
+【焙煎の最中】
+${line('1分ごとの温度', temps)}${line('火力（はじめ）', r.heat)}${line('回転速度', r.rotation)}${line('温度の底', ev(r.turning))}${line('1ハゼ', ev(r.firstCrack))}${line('2ハゼ', ev(r.secondCrack))}${line('煎り止め', ev(r.drop))}${(r.ops || []).length ? line('途中の操作', r.ops.map(o => `${o.sec != null ? fmtTime(o.sec) : ''} ${o.text}`).join('、')) : ''}
+【焙煎の後】
+${line('焼き上がり（ハンドピック前）', r.outG != null ? `${r.outG}g` : '')}${line('減り率', loss == null ? '' : `${loss.toFixed(1)}%（倍率${rt.toFixed(2)}、一般的な目安では「${roastLevel(loss)}」）`)}${line('焙煎度（自分の判断）', r.level)}${line('ハンドピックで除いた量（焙煎後）', r.pickAfterG != null ? `${r.pickAfterG}g` : '')}${line('豆の色', r.color)}${line('ムラ・チャフ', r.unevenness)}${line('メモ', r.memo)}${tastings ? `\n【味見】\n${tastings}\n` : ''}${past ? `\n【同じ豆の最近の焙煎（くらべる参考）】\n${past}\n` : ''}`.replace(/\n{3,}/g, '\n\n');
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (e) {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  }
+}
+
+// 共有画面で、記録の文章と写真をまとめて Claude アプリへ。文章は念のためコピーもしておく
+async function askAi(r) {
+  const text = aiPrompt(r);
+  const copied = await copyText(text);
+  const photos = (await Promise.all((r.photoIds || []).map(getPhoto))).filter(Boolean);
+  const files = photos.map((p, i) => dataUrlToFile(p.dataUrl, `${r.lot}_${i + 1}.jpg`));
+  const share = { text, title: `焙煎の評価 ${r.lot}` };
+  if (files.length && navigator.canShare?.({ files })) share.files = files;
+  if (navigator.share) {
+    try {
+      await navigator.share(share);
+      return;
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+    }
+  }
+  toast(copied ? '記録をコピーしました。Claudeアプリに貼り付けてください' : 'コピーできませんでした');
+}
+
+function aiReviewHtml(r) {
+  return `
+    <h2>AIの評価</h2>
+    <div class="card">
+      <button class="btn primary ai" id="askAi">🤖 AIに評価してもらう</button>
+      <div class="hint">共有画面が開いたら「Claude」を選んで送ってください。記録の文章はコピーもされるので、Claudeアプリに貼り付けても使えます。${(r.photoIds || []).length ? '写真も一緒に送られます。' : '写真があると、見た目も評価してもらえます。'}</div>
+      <div class="field" style="margin-top:14px"><label>返ってきた評価を貼り付けて残す</label>
+        <textarea id="aiText" placeholder="Claudeの答えをコピーして、ここに貼り付け">${esc(r.aiReview?.text || '')}</textarea>
+        ${r.aiReview?.date ? `<div class="hint">保存した日：${fmtDate(r.aiReview.date)}</div>` : ''}
+      </div>
+      <button class="btn ghost" id="saveAi">AIの評価を保存する</button>
+    </div>`;
 }
 
 // ---------- 焙煎カードの入力 ----------
@@ -662,7 +889,7 @@ function editRoast(id) {
         </div>
         <div class="field"><label>目指す焙煎度</label>
           <div class="recommend" id="recommend"></div>
-          <select name="targetLevel"><option value="">選ばない</option>${ROAST_LEVELS.map(([, n]) => `<option ${r.targetLevel === n ? 'selected' : ''}>${n}</option>`).join('')}</select>
+          <select name="targetLevel"><option value="">選ばない</option>${ROAST_LEVELS.map(([, n]) => `<option value="${n}" ${r.targetLevel === n ? 'selected' : ''}>${n}（${ROAST_INFO[n].range}）</option>`).join('')}</select>
           <div class="hint">選ぶと「焙煎の最中」に、目指すカーブと1ハゼ・煎り止めの目標が出ます</div></div>
         <div class="field"><label>量った生豆の量（ハンドピックの前）</label>
           <div class="inline"><input name="greenG" inputmode="decimal" value="${r.greenG ?? ''}" placeholder="例：210"><span class="unit">g</span></div></div>
@@ -714,11 +941,12 @@ function editRoast(id) {
           <div class="inline"><input name="keptG" inputmode="decimal" value="${r.keptG ?? usableG(r) ?? ''}" placeholder="例：167"><span class="unit">g</span></div>
           <div class="hint">上の2つを入れると自動で計算します。直接入れることもできます</div></div>
         <div class="field"><label>焙煎度（自分の判断）</label>
-          <select name="level"><option value="">選ぶ（空なら目安を使います）</option>${ROAST_LEVELS.map(([, n]) => `<option ${r.level === n ? 'selected' : ''}>${n}</option>`).join('')}</select>
+          <select name="level"><option value="">選ぶ（空なら目安を使います）</option>${ROAST_LEVELS.map(([, n]) => `<option value="${n}" ${r.level === n ? 'selected' : ''}>${n}（${ROAST_INFO[n].range}）</option>`).join('')}</select>
           <div class="preview" id="levelPreview"></div></div>
         <div class="field"><label>豆の色</label><input name="color" value="${esc(r.color || '')}" placeholder="例：明るい茶色、ツヤなし"></div>
         <div class="field"><label>ムラ・チャフの様子</label><input name="unevenness" value="${esc(r.unevenness || '')}" placeholder="例：ムラ少し、チャフ多め"></div>
         <div class="field"><label>ひとことメモ</label><textarea name="memo" placeholder="例：香ばしい。1ハゼから2分で終了">${esc(r.memo || '')}</textarea></div>
+        <div class="hint">📷 豆の写真は、保存したあとの焙煎カードの画面で追加できます</div>
       </div>
     </form>
     <button class="btn primary" id="saveRoast">保存する</button>
@@ -780,7 +1008,7 @@ function editRoast(id) {
     const lv = main.querySelector('#levelPreview');
     lv.textContent = loss == null
       ? '減り率：投入量と焼き上がりの重さを入れると出ます'
-      : `減り率 ${loss.toFixed(1)}%（目安は「${roastLevel(loss)}」）`;
+      : `減り率 ${loss.toFixed(1)}%（目安は「${roastLevel(loss)}」${ROAST_INFO[roastLevel(loss)].depth}：${ROAST_INFO[roastLevel(loss)].taste}）`;
     updatePlan(now);
   };
 
@@ -953,6 +1181,7 @@ function editRoast(id) {
     data.roasts = data.roasts.filter(x => x.id !== id);
     save();
     clearDraft();
+    cleanupPhotos();
     showTab('roasts');
   });
 }
@@ -1273,7 +1502,7 @@ function renderSettings() {
 
     <h2>バックアップ</h2>
     <div class="card">
-      <div class="note">記録はこのスマホの中に保存されています。ときどき「書き出す」でファイルに残しておくと安心です。</div>
+      <div class="note">記録と写真はこのスマホの中に保存されています。ときどき「書き出す」でファイルに残しておくと安心です（写真も入ります）。</div>
       <button class="btn ghost" id="exportData">バックアップを書き出す</button>
       <button class="btn ghost" id="importData">バックアップから戻す</button>
       <input type="file" id="importFile" accept=".json,application/json" hidden>
@@ -1293,8 +1522,10 @@ function renderSettings() {
       const restored = JSON.parse(await file.files[0].text());
       if (!Array.isArray(restored.beans) || !Array.isArray(restored.roasts)) throw new Error();
       if (!confirm(`生豆${restored.beans.length}種類・焙煎${restored.roasts.length}回分に置きかえます。今のスマホの記録は消えます。よろしいですか？`)) return;
-      data = { beans: [], roasts: [], ...restored };
+      const { photos = [], ...rest } = restored;
+      data = { beans: [], roasts: [], ...rest };
       save();
+      for (const p of photos) await putPhoto(p);
       toast('バックアップから戻しました');
       showTab('roasts');
     } catch (e) {
@@ -1336,10 +1567,12 @@ function importSeed() {
   return SEED_ROASTS.length;
 }
 
-function exportData() {
+async function exportData() {
   const d = new Date();
   const stamp = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
-  const blob = new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' });
+  let photos = [];
+  try { photos = await allPhotos(); } catch (e) { /* 写真なしで書き出す */ }
+  const blob = new Blob([JSON.stringify({ ...data, photos }, null, 1)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = `焙煎記録_バックアップ_${stamp}.json`;
@@ -1372,3 +1605,6 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) chec
 
 showTab('roasts');
 checkUpdate();
+cleanupPhotos();
+// スマホが空き容量の都合で記録を消さないようにお願いする
+navigator.storage?.persist?.().catch(() => {});
