@@ -129,6 +129,7 @@ function esc(s) {
 }
 
 function setHeader(title, onBack) {
+  if (typeof stopVoice === 'function') stopVoice();
   titleEl.textContent = title;
   backBtn.hidden = !onBack;
   backBtn.onclick = onBack || null;
@@ -503,6 +504,47 @@ function showRoast(id) {
   });
 }
 
+// ---------- 声での温度入力 ----------
+
+let activeVoice = null;  // 聞いている途中の声の入力。画面を移るときに止める
+
+function stopVoice() {
+  if (activeVoice) activeVoice.stop();
+  activeVoice = null;
+}
+
+// 「百六十五」「165」「１６５」などを数にする
+function parseJaNumber(text) {
+  const s = text.replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).replace(/[,，\s]/g, '');
+  if (/^\d+(\.\d+)?$/.test(s)) return Number(s);
+  const digits = { 〇: 0, 零: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  const units = { 十: 10, 百: 100 };
+  if (!/^[〇零一二三四五六七八九十百]+$/.test(s)) return null;
+  let total = 0, cur = 0;
+  for (const c of s) {
+    if (c in digits) cur = cur * 10 + digits[c];
+    else { total += (cur || 1) * units[c]; cur = 0; }
+  }
+  return total + cur;
+}
+
+// 聞き取った言葉 →「何分の、何度」。分を言わなければ minute は null
+function parseVoiceTemp(text) {
+  const t = text.replace(/[。、．\s]/g, '').replace(/°C|℃|°/g, '度').replace(/(度|ど)(です)?$/, '');
+  const NUM = '[0-9０-９〇零一二三四五六七八九十百.]+';
+  const withMin = t.match(new RegExp(`^(${NUM})(?:分|ふん|ぷん)(${NUM})(?:度|℃)?$`));
+  if (withMin) {
+    const minute = parseJaNumber(withMin[1]), temp = parseJaNumber(withMin[2]);
+    return minute != null && temp != null ? { minute, temp } : null;
+  }
+  const only = t.match(new RegExp(`^(${NUM})(?:度|℃)?$`));
+  if (only) {
+    const temp = parseJaNumber(only[1]);
+    return temp != null ? { minute: null, temp } : null;
+  }
+  return null;
+}
+
 // ---------- 焙煎カードの入力 ----------
 
 const WEATHERS = ['晴れ', 'くもり', '雨', '雪'];
@@ -646,6 +688,8 @@ function editRoast(id) {
       <div class="card">
         <div id="chartBox"></div>
         <div class="field"><label>1分ごとの温度（℃）</label>
+          <button type="button" class="btn voice" id="voiceBtn">🎤 声で温度を入れる</button>
+          <div class="voice-status" id="voiceStatus" hidden></div>
           <div class="temp-grid" id="tempGrid">${tempCells(minutes)}</div>
           <button type="button" class="add-line" id="addMinute">＋ 1分ふやす</button></div>
         <div class="field"><label>火力（はじめ）</label><input name="heat" value="${esc(r.heat || '')}" placeholder="例：中火、つまみ3"></div>
@@ -797,6 +841,82 @@ function editRoast(id) {
     const i = grid.children.length;
     grid.insertAdjacentHTML('beforeend', `<label class="t-cell"><span>${i}分</span><input name="t${i}" inputmode="numeric"></label>`);
     grid.lastElementChild.querySelector('input').focus();
+  });
+
+  // 声で温度を入れる：「165」→ 次の空いている分へ、「3分165」→ 3分へ、「とりけし」→ 声で入れた最後を消す
+  const voiceBtn = main.querySelector('#voiceBtn');
+  const voiceStatus = main.querySelector('#voiceStatus');
+  const voiceFilled = [];
+  const cell = i => {
+    const grid = main.querySelector('#tempGrid');
+    while (grid.children.length <= i) main.querySelector('#addMinute').click();
+    return form.elements[`t${i}`];
+  };
+  const nextEmpty = () => {
+    const cells = [...form.querySelectorAll('.t-cell input')];
+    let last = -1;
+    cells.forEach((el, i) => { if (el.value.trim()) last = i; });
+    return last + 1;
+  };
+  const say = (msg, ok = true) => {
+    voiceStatus.hidden = false;
+    voiceStatus.className = `voice-status ${ok ? '' : 'ng'}`;
+    voiceStatus.textContent = msg;
+  };
+  const onHeard = text => {
+    if (/取り?消し?|とりけし|もどす|戻す/.test(text)) {
+      const i = voiceFilled.pop();
+      if (i == null) return say('取り消すものがありません', false);
+      cell(i).value = '';
+      remember();
+      return say(`${i}分の温度を消しました`);
+    }
+    const got = parseVoiceTemp(text);
+    if (!got || got.temp < 0 || got.temp > 300) return say(`「${text}」は聞き取れませんでした。もう一度どうぞ`, false);
+    const i = got.minute ?? nextEmpty();
+    const el = cell(i);
+    el.value = got.temp;
+    el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+    voiceFilled.push(i);
+    remember();
+    say(`${i}分：${got.temp}℃ を入れました`);
+  };
+
+  voiceBtn.addEventListener('click', () => {
+    if (activeVoice) { stopVoice(); return; }
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      say('このスマホ・ブラウザでは声の入力が使えません。Safariで試してください', false);
+      return;
+    }
+    const rec = new SpeechRecognition();
+    rec.lang = 'ja-JP';
+    rec.continuous = true;
+    rec.interimResults = false;
+    let on = true;
+    rec.onresult = e => {
+      for (let k = e.resultIndex; k < e.results.length; k++) {
+        if (e.results[k].isFinal) onHeard(e.results[k][0].transcript.trim());
+      }
+    };
+    rec.onerror = e => {
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+        on = false;
+        say('マイクが使えません。iPhoneの「設定」でマイクを許可してください', false);
+      }
+    };
+    // しばらく黙っていると止まるので、ボタンで止めるまで聞き直す
+    rec.onend = () => { if (on && activeVoice === handle) { try { rec.start(); } catch (err) { /* すぐ次で再開 */ } } else finish(); };
+    const finish = () => {
+      voiceBtn.classList.remove('on');
+      voiceBtn.textContent = '🎤 声で温度を入れる';
+    };
+    const handle = { stop: () => { on = false; try { rec.stop(); } catch (err) { /* もう止まっている */ } finish(); } };
+    activeVoice = handle;
+    rec.start();
+    voiceBtn.classList.add('on');
+    voiceBtn.textContent = '⏹ 声の入力を止める';
+    say('聞いています。「165」や「3分 165」のように言ってください');
   });
 
   const opsBox = main.querySelector('#ops');

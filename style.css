@@ -230,3 +230,12 @@ textarea:focus { outline: 2px solid var(--brand); border-color: transparent; }
 .rate.star button { font-size: 26px; border: none; background: none; color: #ddd5cc; }
 .rate.star button.on { color: #e0a020; }
 .rate-row { margin-bottom: 12px; }
+
+/* ---------- 声での温度入力 ---------- */
+.btn.voice { background: #fff; color: var(--brand); border: 2px solid var(--brand); margin: 0 0 10px; }
+.btn.voice.on { background: #c62828; border-color: #c62828; color: #fff; animation: pulse 1.6s infinite; }
+@keyframes pulse { 50% { opacity: .75; } }
+.voice-status { background: #e8f1e4; color: #2e5d22; border-radius: 10px; padding: 10px 12px; font-size: 15px; font-weight: 600; margin-bottom: 10px; }
+.voice-status.ng { background: #fdecea; color: #b3261e; }
+.t-cell input.flash { animation: flash 1.2s; }
+@keyframes flash { 0% { background: #ffe9a8; } 100% { background: #fff; } }
