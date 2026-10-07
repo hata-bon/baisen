@@ -39,14 +39,19 @@ const SEED_BEANS = {
 
 // ---------- データの読み書き ----------
 
+const DEFAULT_SETTINGS = {
+  gasCanPrice: null,  // カセットガスのボンベ1本の値段（円・税込）
+  roastsPerCan: 10,   // ボンベ1本で焼ける回数
+};
+
 let data = load();
 
 function load() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORE_KEY));
-    if (saved) return { beans: [], roasts: [], ...saved };
+    if (saved) return { beans: [], roasts: [], ...saved, settings: { ...DEFAULT_SETTINGS, ...saved.settings } };
   } catch (e) { /* 読めなければ空から始める */ }
-  return { beans: [], roasts: [] };
+  return { beans: [], roasts: [], settings: { ...DEFAULT_SETTINGS } };
 }
 
 function save() {
@@ -431,6 +436,68 @@ function curveSvg(r, plan) {
     </div>`;
 }
 
+// ---------- 焙煎豆の原価 ----------
+// 生豆代（ハンドピックで除いた分も含めて、使った生豆すべて）＋ガス代 を、焙煎後に残った量で割る。
+// ドリップ1杯の原価と売値は、原価計算アプリで「焙煎豆」を材料として使って決める
+
+function yenOf(n) {
+  return `${Math.round(n).toLocaleString('ja-JP')}円`;
+}
+
+function gasPerRoast() {
+  const s = data.settings || DEFAULT_SETTINGS;
+  const price = num(s.gasCanPrice), times = num(s.roastsPerCan);
+  return price && times ? price / times : null;
+}
+
+function roastCost(r) {
+  const bean = data.beans.find(b => b.id === r.beanId);
+  const pricePerKg = num(bean?.pricePerKg);
+  const greenUsed = num(r.greenG) ?? (num(r.inG) != null ? num(r.inG) + (num(r.pickBeforeG) || 0) : null);
+  const yieldG = usableG(r) ?? num(r.outG);
+  const missing = [];
+  if (!pricePerKg) missing.push('生豆の1kgあたりの値段');
+  if (!greenUsed) missing.push('投入量');
+  if (!yieldG) missing.push('焼き上がりの重さ');
+  if (missing.length) return { missing };
+  const beanYen = greenUsed / 1000 * pricePerKg;
+  const gasYen = gasPerRoast() || 0;
+  const totalYen = beanYen + gasYen;
+  return { pricePerKg, greenUsed, yieldG, beanYen, gasYen, totalYen, per100: totalYen / yieldG * 100, perG: totalYen / yieldG };
+}
+
+function costHtml(r) {
+  const c = roastCost(r);
+  if (c.missing) {
+    return `<h2>原価</h2><div class="card"><div class="note">${c.missing.join('・')}が入ると、焙煎豆の原価が出ます。${c.missing.includes('生豆の1kgあたりの値段') ? '値段は「🫘 生豆」で入れられます。' : ''}</div></div>`;
+  }
+  const dose = latestTasting(r)?.doseG || 15;
+  return `
+    <h2>原価</h2>
+    <div class="card">
+      <div class="hero">
+        <div><span>焙煎豆100gあたり</span><b>${yenOf(c.per100)}</b></div>
+        <div><span>1杯分（豆${dose}g）</span><b>${yenOf(c.perG * dose)}</b></div>
+        <div><span>今回の合計</span><b>${yenOf(c.totalYen)}</b></div>
+      </div>
+      ${kvRows([
+        ['生豆代', `${yenOf(c.beanYen)}<div class="hint">${g(c.greenUsed)} × ${Number(c.pricePerKg).toLocaleString()}円/kg（ハンドピックで除いた分も含む）</div>`],
+        ['ガス代', c.gasYen ? `${yenOf(c.gasYen)}<div class="hint">ボンベ1本 ${Number(data.settings.gasCanPrice).toLocaleString()}円 ÷ ${data.settings.roastsPerCan}回</div>` : '―<div class="hint">「⚙️ 設定」でボンベの値段を入れると足されます</div>'],
+        ['使える焙煎豆', `${g(c.yieldG)}<div class="hint">ハンドピックの後に残った量</div>`],
+      ])}
+      <button class="btn ghost" id="copyCost">📋 原価計算アプリ用にコピー</button>
+      <div class="hint">原価計算アプリの「材料」に、この焙煎豆を登録するための内容をコピーします</div>
+    </div>`;
+}
+
+function costCopyText(r) {
+  const c = roastCost(r);
+  return `材料の名前：焙煎豆 ${beanName(r.beanId)}（${r.lot}）
+どちらで使う：カフェ用
+仕入れの量：100 g
+仕入れ値（税込）：${Math.round(c.per100)} 円`;
+}
+
 // ---------- 焙煎カード（くわしく） ----------
 
 function kvRows(rows) {
@@ -441,6 +508,7 @@ function showRoast(id) {
   const r = data.roasts.find(x => x.id === id);
   if (!r) return showTab('roasts');
   setHeader(r.lot, () => showTab('roasts'));
+  document.querySelectorAll('.tabbar button').forEach(b => b.classList.toggle('active', b.dataset.tab === 'roasts'));
 
   const loss = lossRate(r), rt = ratio(r);
   const autoLv = roastLevel(loss);
@@ -497,6 +565,7 @@ function showRoast(id) {
       opt('ムラ・チャフ', esc(r.unevenness)),
       ['メモ', esc(r.memo || '―')],
     ])}</div>
+    ${costHtml(r)}
     <h2>焙煎後の豆の写真</h2>
     <div class="card" id="photoBox"></div>
     ${tastingsHtml(r)}
@@ -510,6 +579,9 @@ function showRoast(id) {
   main.querySelector('#editRoast').addEventListener('click', () => editRoast(r.id));
   main.querySelector('#addTasting').addEventListener('click', () => editTasting(r.id));
   renderPhotos(r, main.querySelector('#photoBox'));
+  main.querySelector('#copyCost')?.addEventListener('click', async () => {
+    toast(await copyText(costCopyText(r)) ? 'コピーしました。原価計算アプリの「材料」で使ってください' : 'コピーできませんでした');
+  });
   main.querySelector('#askAi').addEventListener('click', () => askAi(r));
   main.querySelector('#saveAi').addEventListener('click', () => {
     const text = main.querySelector('#aiText').value.trim();
@@ -1403,6 +1475,10 @@ function renderBeans() {
           ${b.pricePerKg ? `<span class="big">${Number(b.pricePerKg).toLocaleString()}<small style="font-size:12px">円/kg</small></span>` : ''}
         </div>
         <div class="sub">${sub || '産地などは未入力'}・焙煎 ${n}回</div>
+        ${(() => {
+          const last = data.roasts.filter(r => r.beanId === b.id && !roastCost(r).missing).sort((x, y) => y.date.localeCompare(x.date))[0];
+          return last ? `<div class="sub">焙煎豆100gあたり <b>${yenOf(roastCost(last).per100)}</b>（${esc(last.lot)}）</div>` : '';
+        })()}
       </button>`;
   }
   html += `<button class="btn primary" id="addBean">＋ 生豆を登録する</button>`;
@@ -1500,6 +1576,15 @@ function renderSettings() {
         : `<button class="btn primary" id="importSeed">過去の記録（9回分）を取り込む</button>`}
     </div>
 
+    <h2>ガス代（原価の計算に使います）</h2>
+    <div class="card">
+      <div class="field"><label>カセットガスのボンベ1本の値段（税込）</label>
+        <div class="inline"><input id="gasCanPrice" inputmode="numeric" value="${data.settings.gasCanPrice ?? ''}" placeholder="例：180"><span class="unit">円</span></div></div>
+      <div class="field"><label>ボンベ1本で焼ける回数</label>
+        <div class="inline"><input id="roastsPerCan" inputmode="numeric" value="${data.settings.roastsPerCan ?? ''}"><span class="unit">回</span></div>
+        <div class="preview" id="gasPreview"></div></div>
+    </div>
+
     <h2>バックアップ</h2>
     <div class="card">
       <div class="note">記録と写真はこのスマホの中に保存されています。ときどき「書き出す」でファイルに残しておくと安心です（写真も入ります）。</div>
@@ -1514,6 +1599,17 @@ function renderSettings() {
     showTab('roasts');
   });
 
+  const gasPreview = () => {
+    const per = gasPerRoast();
+    main.querySelector('#gasPreview').textContent = per ? `→ 1回の焙煎あたり ${per.toFixed(1)}円` : '→ 値段を入れると、1回あたりのガス代が出ます';
+  };
+  ['gasCanPrice', 'roastsPerCan'].forEach(key => main.querySelector(`#${key}`).addEventListener('input', e => {
+    data.settings[key] = num(e.target.value);
+    save();
+    gasPreview();
+  }));
+  gasPreview();
+
   main.querySelector('#exportData').addEventListener('click', exportData);
   const file = main.querySelector('#importFile');
   main.querySelector('#importData').addEventListener('click', () => file.click());
@@ -1523,7 +1619,7 @@ function renderSettings() {
       if (!Array.isArray(restored.beans) || !Array.isArray(restored.roasts)) throw new Error();
       if (!confirm(`生豆${restored.beans.length}種類・焙煎${restored.roasts.length}回分に置きかえます。今のスマホの記録は消えます。よろしいですか？`)) return;
       const { photos = [], ...rest } = restored;
-      data = { beans: [], roasts: [], ...rest };
+      data = { beans: [], roasts: [], ...rest, settings: { ...DEFAULT_SETTINGS, ...rest.settings } };
       save();
       for (const p of photos) await putPhoto(p);
       toast('バックアップから戻しました');
