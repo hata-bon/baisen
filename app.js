@@ -486,16 +486,18 @@ function costHtml(r) {
         ['使える焙煎豆', `${g(c.yieldG)}<div class="hint">ハンドピックの後に残った量</div>`],
       ])}
       <button class="btn ghost" id="copyCost">📋 原価計算アプリ用にコピー</button>
-      <div class="hint">原価計算アプリの「材料」に、この焙煎豆を登録するための内容をコピーします</div>
+      <div class="hint">コピーしたら、原価計算アプリの「🧺 材料」で「📋 焙煎豆を貼り付け」を押してください</div>
     </div>`;
 }
 
 function costCopyText(r) {
   const c = roastCost(r);
-  return `材料の名前：焙煎豆 ${beanName(r.beanId)}（${r.lot}）
+  // 名前にロット番号を入れないので、同じ豆なら原価計算アプリの同じ材料の値段が置きかわる
+  return `材料の名前：焙煎豆 ${beanName(r.beanId)}
 どちらで使う：カフェ用
 仕入れの量：100 g
-仕入れ値（税込）：${Math.round(c.per100)} 円`;
+仕入れ値（税込）：${Math.round(c.per100)} 円
+仕入れ先：自家焙煎 ロット${r.lot}`;
 }
 
 // ---------- 焙煎カード（くわしく） ----------
