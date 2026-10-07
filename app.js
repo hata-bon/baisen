@@ -147,6 +147,7 @@ function esc(s) {
 
 function setHeader(title, onBack) {
   if (typeof stopVoice === 'function') stopVoice();
+  if (typeof closeTimerView === 'function') closeTimerView();
   titleEl.textContent = title;
   backBtn.hidden = !onBack;
   backBtn.onclick = onBack || null;
@@ -373,12 +374,12 @@ const NOTE_BAND = [
 const DROP_ZONE = [13, 15];
 
 // 焙煎カーブのグラフ。赤い帯・黄色の列＝紙のシートの目安、点線＝目指すカーブ、実線＝今回の1分ごとの温度
-function curveSvg(r, plan) {
+function curveSvg(r, plan, nowSec = null) {
   const temps = (r.temps || []).map((t, i) => [i * 60, num(t)]).filter(([, t]) => t != null);
   const events = [['firstCrack', '1ハゼ'], ['secondCrack', '2ハゼ'], ['drop', '煎り止め']]
     .map(([k, label]) => ({ ...r[k], label }))
     .filter(e => e.sec != null);
-  const allS = [...temps.map(p => p[0]), ...(plan ? [plan.drop.sec] : []), ...events.map(e => e.sec)];
+  const allS = [...temps.map(p => p[0]), ...(plan ? [plan.drop.sec] : []), ...events.map(e => e.sec), ...(nowSec != null ? [nowSec] : [])];
   const xMax = Math.max(16, Math.ceil(Math.max(0, ...allS) / 60) + 1);
   const band = NOTE_BAND.filter(([m]) => m <= xMax);
   const allT = [...temps.map(p => p[1]), ...(plan ? plan.points.map(p => p[1]) : []), ...events.map(e => e.temp).filter(v => v != null),
@@ -403,6 +404,9 @@ function curveSvg(r, plan) {
   }
   for (let m = 0; m <= xMax; m += 2) {
     svg += `<text x="${x(m * 60)}" y="${H - 8}" class="ax" text-anchor="middle">${m}分</text>`;
+  }
+  if (nowSec != null) {
+    svg += `<line x1="${x(nowSec)}" x2="${x(nowSec)}" y1="${T}" y2="${H - B}" class="now"/><text x="${x(nowSec) + 3}" y="${T + 10}" class="now-label">いま</text>`;
   }
   if (plan) {
     svg += `<path d="${path(plan.points)}" class="target"/>`;
@@ -608,6 +612,34 @@ let activeVoice = null;  // 聞いている途中の声の入力。画面を移�
 function stopVoice() {
   if (activeVoice) activeVoice.stop();
   activeVoice = null;
+}
+
+// 声を聞き続ける。onText に聞き取った言葉を渡す。止めるまで、黙って止まっても聞き直す
+function startListening({ onText, onError, onStop }) {
+  stopVoice();
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { onError('このスマホ・ブラウザでは声の入力が使えません。Safariで試してください'); return null; }
+  const rec = new SR();
+  rec.lang = 'ja-JP';
+  rec.continuous = true;
+  rec.interimResults = false;
+  let on = true;
+  rec.onresult = e => {
+    for (let k = e.resultIndex; k < e.results.length; k++) {
+      if (e.results[k].isFinal) onText(e.results[k][0].transcript.trim());
+    }
+  };
+  rec.onerror = e => {
+    if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+      on = false;
+      onError('マイクが使えません。iPhoneの「設定」でマイクを許可してください');
+    }
+  };
+  const handle = { stop: () => { on = false; try { rec.stop(); } catch (err) { /* もう止まっている */ } onStop(); } };
+  rec.onend = () => { if (on && activeVoice === handle) { try { rec.start(); } catch (err) { /* すぐ次で再開 */ } } else onStop(); };
+  activeVoice = handle;
+  rec.start();
+  return handle;
 }
 
 // 「百六十五」「165」「１６５」などを数にする
@@ -851,6 +883,49 @@ function aiReviewHtml(r) {
     </div>`;
 }
 
+// ---------- 焙煎タイマーの道具 ----------
+
+let closeTimerView = null;  // タイマーの画面が開いているときの「閉じる」
+
+function fmtClock(sec) {
+  return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
+}
+
+// 音（iPhoneは、ボタンを押したときに一度音を出す準備をしないと鳴らない）
+let audioCtx = null;
+function unlockSound() {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    audioCtx.resume();
+  } catch (e) { /* 音が出せなくても記録はできる */ }
+}
+function beep(times = 1) {
+  navigator.vibrate?.(times > 1 ? [150, 80, 150, 80, 150] : 120);
+  if (!audioCtx) return;
+  for (let i = 0; i < times; i++) {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.frequency.value = 1046;
+    o.connect(g); g.connect(audioCtx.destination);
+    const t = audioCtx.currentTime + i * 0.28;
+    g.gain.setValueAtTime(0.3, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+    o.start(t); o.stop(t + 0.22);
+  }
+}
+
+// 焙煎中に画面が自動で消えないようにする
+let wakeLock = null, wakeWanted = false;
+async function requestWakeLock() {
+  wakeWanted = true;
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (e) { /* 使えない機種でも記録はできる */ }
+}
+function releaseWakeLock() {
+  wakeWanted = false;
+  try { wakeLock?.release(); } catch (e) { /* もう外れている */ }
+  wakeLock = null;
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden && wakeWanted) requestWakeLock(); });
+
 // ---------- 焙煎カードの入力 ----------
 
 const WEATHERS = ['晴れ', 'くもり', '雨', '雪'];
@@ -993,6 +1068,7 @@ function editRoast(id) {
 
       <h2>焙煎の最中</h2>
       <div class="card">
+        <button type="button" class="btn primary timer-open" id="timerBtn">⏱ 焙煎タイマーで記録する</button>
         <div id="chartBox"></div>
         <div class="field"><label>1分ごとの温度（℃）</label>
           <button type="button" class="btn voice" id="voiceBtn">🎤 声で温度を入れる</button>
@@ -1199,36 +1275,11 @@ function editRoast(id) {
 
   voiceBtn.addEventListener('click', () => {
     if (activeVoice) { stopVoice(); return; }
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      say('このスマホ・ブラウザでは声の入力が使えません。Safariで試してください', false);
-      return;
-    }
-    const rec = new SpeechRecognition();
-    rec.lang = 'ja-JP';
-    rec.continuous = true;
-    rec.interimResults = false;
-    let on = true;
-    rec.onresult = e => {
-      for (let k = e.resultIndex; k < e.results.length; k++) {
-        if (e.results[k].isFinal) onHeard(e.results[k][0].transcript.trim());
-      }
-    };
-    rec.onerror = e => {
-      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
-        on = false;
-        say('マイクが使えません。iPhoneの「設定」でマイクを許可してください', false);
-      }
-    };
-    // しばらく黙っていると止まるので、ボタンで止めるまで聞き直す
-    rec.onend = () => { if (on && activeVoice === handle) { try { rec.start(); } catch (err) { /* すぐ次で再開 */ } } else finish(); };
     const finish = () => {
       voiceBtn.classList.remove('on');
       voiceBtn.textContent = '🎤 声で温度を入れる';
     };
-    const handle = { stop: () => { on = false; try { rec.stop(); } catch (err) { /* もう止まっている */ } finish(); } };
-    activeVoice = handle;
-    rec.start();
+    if (!startListening({ onText: onHeard, onError: msg => say(msg, false), onStop: finish })) return;
     voiceBtn.classList.add('on');
     voiceBtn.textContent = '⏹ 声の入力を止める';
     say('聞いています。「165」や「3分 165」のように言ってください');
@@ -1245,6 +1296,255 @@ function editRoast(id) {
     e.target.closest('.op-row').remove();
     remember();
   });
+
+  // ---------- 焙煎タイマー ----------
+  // 入れた内容は、この入力画面の欄にそのまま入る。時刻は「投入した時刻」から計算するので、画面が消えても続きから戻れる
+
+  const setEvent = (key, sec, temp) => {
+    if (sec != null) {
+      form.elements[`${key}.min`].value = Math.floor(sec / 60);
+      form.elements[`${key}.sec`].value = sec % 60;
+    }
+    if (temp != null) form.elements[`${key}.temp`].value = temp;
+    remember();
+  };
+  const addOp = (sec, text) => {
+    opsBox.insertAdjacentHTML('beforeend', opRowHtml({ sec, text }));
+    remember();
+  };
+  const timerBtn = main.querySelector('#timerBtn');
+  const timerLabel = () => {
+    timerBtn.textContent = r.timerStart && !r.timerEnd ? '⏱ タイマーに戻る（動いています）' : r.timerEnd ? '⏱ タイマーの画面を見る' : '⏱ 焙煎タイマーで記録する';
+  };
+  timerLabel();
+
+  const openTimer = () => {
+    unlockSound();
+    const bean = data.beans.find(b => b.id === form.elements.beanId.value);
+    const view = document.createElement('div');
+    view.className = 'timer-view';
+    view.innerHTML = `
+      <div class="tv-top">
+        <button type="button" class="tv-close">‹ 入力画面へ</button>
+        <span>${esc(bean?.name || '')}${form.elements.targetLevel.value ? `・目指す ${esc(form.elements.targetLevel.value)}` : ''}</span>
+      </div>
+      <div class="tv-time" id="tvTime">0:00</div>
+      <div class="tv-target" id="tvTarget"></div>
+      <div id="tvChart"></div>
+      <div class="tv-entry">
+        <div class="tv-ask" id="tvAsk"></div>
+        <div class="tv-input">
+          <input id="tvTemp" inputmode="numeric" autocomplete="off" placeholder="温度"><span>℃</span>
+          <button type="button" id="tvOk">記録</button>
+        </div>
+        <div class="tv-msg" id="tvMsg"></div>
+      </div>
+      <button type="button" class="tv-start" id="tvStart">▶ 投入した（スタート）</button>
+      <div class="tv-events">
+        <button type="button" data-ev="turning">底</button>
+        <button type="button" data-ev="firstCrack">1ハゼ</button>
+        <button type="button" data-ev="secondCrack">2ハゼ</button>
+        <button type="button" data-ev="drop" class="drop">煎り止め</button>
+      </div>
+      <div class="tv-ops">
+        ${['火力を強めた', '火力を弱めた', '蓋を開けた', '蓋を閉めた'].map(t => `<button type="button" data-op="${t}">${t}</button>`).join('')}
+      </div>
+      <button type="button" class="tv-mic" id="tvMic">🎤 声で入れる</button>
+      <button type="button" class="tv-done" id="tvDone" hidden>焙煎の後を入力する ›</button>`;
+    document.body.appendChild(view);
+    const $ = sel => view.querySelector(sel);
+    const EV_LABEL = Object.fromEntries(EVENTS.map(([k]) => [k, { turning: '底', firstCrack: '1ハゼ', secondCrack: '2ハゼ', drop: '煎り止め' }[k]]));
+
+    const elapsed = () => (r.timerStart ? Math.max(0, Math.floor(((r.timerEnd || Date.now()) - r.timerStart) / 1000)) : 0);
+    const running = () => r.timerStart && !r.timerEnd;
+    const tempAtMinute = i => num(form.elements[`t${i}`]?.value);
+
+    // 次に入れる温度の行き先。{ kind: 'minute', i } か { kind: 'event', key }
+    let mode = null;
+    // 行き先が決まっていなければ、いちばん近い分。もう入っていれば、まだ入っていない次の分
+    const target = () => {
+      if (mode) return mode;
+      let i = r.timerStart ? Math.round(elapsed() / 60) : 0;
+      while (tempAtMinute(i) != null) i++;
+      return { kind: 'minute', i };
+    };
+    const showAsk = () => {
+      const t = target();
+      const wait = t.kind === 'minute' && r.timerStart ? t.i * 60 - elapsed() : 0;
+      $('#tvAsk').textContent = t.kind === 'event'
+        ? `${EV_LABEL[t.key]}の温度は？`
+        : t.i === 0 ? '投入温度（0分）は？' : `${t.i}分の温度は？${wait > 0 ? `（あと${fmtClock(wait)}）` : ''}`;
+      $('#tvAsk').classList.toggle('event', t.kind === 'event');
+    };
+    const msg = (text, ok = true) => {
+      $('#tvMsg').textContent = text;
+      $('#tvMsg').className = `tv-msg ${ok ? '' : 'ng'}`;
+    };
+
+    const record = temp => {
+      if (temp == null || temp < 0 || temp > 300) { msg('温度を数字で入れてください', false); return; }
+      const t = target();
+      if (t.kind === 'event') {
+        setEvent(t.key, null, temp);
+        msg(`${EV_LABEL[t.key]}：${temp}℃ を記録しました`);
+        if (t.key === 'drop') finishRoast();
+      } else {
+        cell(t.i).value = temp;
+        remember();
+        msg(`${t.i}分：${temp}℃ を記録しました`);
+      }
+      mode = null;
+      $('#tvTemp').value = '';
+      showAsk();
+      refresh();
+    };
+
+    const pressEvent = key => {
+      if (!r.timerStart) { msg('先に「投入した（スタート）」を押してください', false); return; }
+      const sec = elapsed();
+      setEvent(key, sec, null);
+      mode = { kind: 'event', key };
+      beep(1);
+      msg(`${EV_LABEL[key]} ${fmtTime(sec)} を記録しました`);
+      if (key === 'drop') { r.timerEnd = Date.now(); remember(); }
+      showAsk();
+      $('#tvTemp').focus();
+      refresh();
+    };
+
+    const finishRoast = () => {
+      if (!r.timerEnd) { r.timerEnd = Date.now(); remember(); }
+      $('#tvDone').hidden = false;
+      msg('おつかれさまでした。焼き上がりの重さなどを入れましょう');
+      stopVoice();
+      releaseWakeLock();
+      refresh();
+    };
+
+    // 目標との差（いちばん新しく入れた1分ごとの温度と、目指すカーブ）
+    const targetText = plan => {
+      if (!plan) return '「目指す焙煎度」を選ぶと、目標との差が出ます';
+      let last = null;
+      for (let i = 0; i < 40; i++) if (tempAtMinute(i) != null) last = i;
+      let diff = '';
+      if (last != null && last > 0) {
+        const sec = last * 60;
+        const pts = plan.points;
+        const k = pts.findIndex(([s]) => s >= sec);
+        if (k > 0) {
+          const [s0, t0] = pts[k - 1], [s1, t1] = pts[k];
+          const goal = t0 + (t1 - t0) * (sec - s0) / (s1 - s0);
+          const d = Math.round(tempAtMinute(last) - goal);
+          diff = `<div class="tv-diff ${d > 3 ? 'hi' : d < -3 ? 'lo' : 'ok'}">${last}分：目標より ${d > 0 ? '+' : ''}${d}℃${d > 3 ? '（進んでいる）' : d < -3 ? '（遅れている）' : '（ほぼ目標どおり）'}</div>`;
+        }
+      }
+      return `目標：1ハゼ <b>${fmtTime(plan.fc.sec)}・${plan.fc.temp}℃</b> → 煎り止め <b>${fmtTime(plan.drop.sec)}・${plan.drop.temp}℃</b>${diff}`;
+    };
+
+    let lastMinute = Math.floor(elapsed() / 60);
+    const warned = {};
+    const refresh = () => {
+      const now = collect();
+      const plan = targetPlan(now);
+      $('#tvTarget').innerHTML = targetText(plan);
+      $('#tvChart').innerHTML = curveSvg(now, plan, r.timerStart ? elapsed() : null);
+      $('#tvStart').hidden = !!r.timerStart;
+      view.querySelectorAll('.tv-events button, .tv-ops button').forEach(b => { b.disabled = !running(); });
+      timerLabel();
+    };
+
+    const tick = () => {
+      const e = elapsed();
+      $('#tvTime').textContent = fmtClock(e);
+      if (!running()) return;
+      if (!mode) showAsk();
+      const m = Math.floor(e / 60);
+      if (m > lastMinute) {
+        lastMinute = m;
+        if (!mode || mode.kind === 'minute') mode = tempAtMinute(m) == null ? { kind: 'minute', i: m } : null;
+        beep(1);
+        showAsk();
+        refresh();
+      }
+      // 目標の30秒前に知らせる
+      const plan = targetPlan(collect());
+      if (plan) {
+        if (!warned.fc && !form.elements['firstCrack.min'].value && e >= plan.fc.sec - 30) {
+          warned.fc = true; beep(3); msg(`そろそろ1ハゼ（目標 ${fmtTime(plan.fc.sec)}）`);
+        }
+        if (!warned.drop && !form.elements['drop.min'].value && e >= plan.drop.sec - 30) {
+          warned.drop = true; beep(3); msg(`そろそろ煎り止め（目標 ${fmtTime(plan.drop.sec)}）`);
+        }
+      }
+    };
+    const timer = setInterval(tick, 250);
+
+    $('#tvStart').addEventListener('click', () => {
+      r.timerStart = Date.now();
+      r.timerEnd = null;
+      lastMinute = 0;
+      mode = tempAtMinute(0) == null ? { kind: 'minute', i: 0 } : null;
+      remember();
+      requestWakeLock();
+      beep(1);
+      msg('スタートしました。1分ごとに音で知らせます');
+      showAsk();
+      refresh();
+    });
+    $('#tvOk').addEventListener('click', () => record(num($('#tvTemp').value)));
+    $('#tvTemp').addEventListener('keydown', e => { if (e.key === 'Enter') record(num($('#tvTemp').value)); });
+    view.querySelectorAll('[data-ev]').forEach(b => b.addEventListener('click', () => pressEvent(b.dataset.ev)));
+    view.querySelectorAll('[data-op]').forEach(b => b.addEventListener('click', () => {
+      const sec = elapsed();
+      addOp(sec, b.dataset.op);
+      msg(`${fmtTime(sec)} ${b.dataset.op} を記録しました`);
+    }));
+
+    // 声：「165」→ 今の行き先へ、「3分 165」→ 3分へ、「1ハゼ」「2ハゼ」「煎り止め」「底」→ その時刻を記録
+    const micBtn = $('#tvMic');
+    const onText = text => {
+      const t = text.replace(/\s/g, '');
+      if (/(1|一|いち|ワン)(ハゼ|はぜ|爆ぜ)/.test(t)) return pressEvent('firstCrack');
+      if (/(2|二|に)(ハゼ|はぜ|爆ぜ)/.test(t)) return pressEvent('secondCrack');
+      if (/(煎り|炒り|入り|いり)(止め|どめ)/.test(t)) return pressEvent('drop');
+      if (/^(底|そこ)$/.test(t)) return pressEvent('turning');
+      const got = parseVoiceTemp(t);
+      if (!got) return msg(`「${text}」は聞き取れませんでした`, false);
+      if (got.minute != null) mode = { kind: 'minute', i: got.minute };
+      record(got.temp);
+    };
+    micBtn.addEventListener('click', () => {
+      if (activeVoice) { stopVoice(); return; }
+      const off = () => { micBtn.classList.remove('on'); micBtn.textContent = '🎤 声で入れる'; };
+      if (!startListening({ onText, onError: m => msg(m, false), onStop: off })) return;
+      micBtn.classList.add('on');
+      micBtn.textContent = '⏹ 声を止める（「165」「1ハゼ」「煎り止め」など）';
+    });
+
+    const close = () => {
+      clearInterval(timer);
+      stopVoice();
+      releaseWakeLock();
+      view.remove();
+      closeTimerView = null;
+      timerLabel();
+    };
+    closeTimerView = close;
+    $('.tv-close').addEventListener('click', close);
+    $('#tvDone').addEventListener('click', () => {
+      close();
+      form.elements.outG.scrollIntoView({ block: 'center' });
+      form.elements.outG.focus();
+    });
+
+    if (running()) requestWakeLock();
+    if (r.timerEnd) { $('#tvDone').hidden = false; msg('この焙煎は煎り止めまで記録ずみです'); }
+    showAsk();
+    refresh();
+    tick();
+  };
+  timerBtn.addEventListener('click', openTimer);
+  if (r.timerStart && !r.timerEnd) openTimer();  // タイマーの途中で画面が消えたときは、そのまま戻る
 
   main.querySelector('#saveRoast').addEventListener('click', () => {
     const next = collect();

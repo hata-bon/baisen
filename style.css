@@ -263,3 +263,45 @@ textarea:focus { outline: 2px solid var(--brand); border-color: transparent; }
 /* ---------- AIの評価 ---------- */
 .btn.ai { margin-top: 0; }
 #aiText { min-height: 120px; }
+
+/* ---------- 焙煎タイマー ---------- */
+.btn.timer-open { margin: 0 0 14px; font-size: 18px; padding: 16px; }
+.curve .now { stroke: #c62828; stroke-width: 1.5; stroke-dasharray: 3 3; }
+.curve .now-label { font-size: 10px; fill: #c62828; }
+.timer-view {
+  position: fixed; inset: 0; z-index: 25; overflow-y: auto; background: var(--bg);
+  padding: calc(env(safe-area-inset-top) + 8px) 16px calc(env(safe-area-inset-bottom) + 24px);
+}
+.tv-top { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
+.tv-top span { flex: 1; text-align: right; }
+.tv-close { background: none; border: none; color: var(--brand); font-size: 16px; font-weight: 700; padding: 6px 0; }
+.tv-time { font-size: 72px; font-weight: 800; text-align: center; color: var(--brand); font-variant-numeric: tabular-nums; line-height: 1.1; margin: 4px 0; }
+.tv-target { font-size: 13px; text-align: center; color: var(--muted); margin-bottom: 6px; line-height: 1.6; }
+.tv-target b { color: var(--text); }
+.tv-diff { display: inline-block; margin-top: 4px; padding: 3px 10px; border-radius: 99px; font-weight: 700; font-size: 14px; }
+.tv-diff.ok { background: #e8f1e4; color: #2e5d22; }
+.tv-diff.hi { background: #fdecea; color: #b3261e; }
+.tv-diff.lo { background: #e6effa; color: #1f4f8a; }
+.tv-entry { background: #fff; border-radius: var(--radius); padding: 12px; margin: 6px 0 10px; box-shadow: 0 1px 2px rgba(0,0,0,.05); }
+.tv-ask { font-size: 20px; font-weight: 800; text-align: center; margin-bottom: 8px; }
+.tv-ask.event { color: #c62828; }
+.tv-input { display: flex; gap: 8px; align-items: center; }
+.tv-input input { flex: 1; font-size: 30px; font-weight: 700; text-align: center; padding: 10px; }
+.tv-input span { font-size: 18px; color: var(--muted); }
+.tv-input button { flex: 0 0 auto; border: none; border-radius: 12px; background: var(--brand); color: #fff; font-size: 18px; font-weight: 700; padding: 16px 18px; }
+.tv-msg { min-height: 20px; text-align: center; font-size: 14px; font-weight: 600; color: #2e5d22; margin-top: 8px; }
+.tv-msg.ng { color: #b3261e; }
+.tv-start { display: block; width: 100%; border: none; border-radius: 14px; background: #2e7d32; color: #fff; font-size: 22px; font-weight: 800; padding: 20px; margin-bottom: 10px; }
+.tv-events { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
+.tv-events button { border: 2px solid var(--brand); background: #fff; color: var(--brand); border-radius: 14px; font-size: 22px; font-weight: 800; padding: 18px 0; }
+.tv-events button.drop { background: #c62828; border-color: #c62828; color: #fff; }
+.tv-events button:active { transform: scale(.97); }
+.tv-ops { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 10px; }
+.tv-ops button { border: 1px solid var(--line); background: #fff; border-radius: 10px; font-size: 14px; padding: 12px 0; color: var(--text); }
+.tv-events button:disabled, .tv-ops button:disabled { opacity: .35; }
+.tv-mic { display: block; width: 100%; border: 2px solid var(--brand); background: #fff; color: var(--brand); border-radius: 12px; font-size: 16px; font-weight: 700; padding: 14px; }
+.tv-mic.on { background: #c62828; border-color: #c62828; color: #fff; animation: pulse 1.6s infinite; }
+.tv-done { display: block; width: 100%; border: none; border-radius: 14px; background: var(--brand); color: #fff; font-size: 18px; font-weight: 800; padding: 18px; margin-top: 10px; }
+
+/* hidden を付けたものは、見た目の指定より優先して隠す */
+[hidden] { display: none !important; }
