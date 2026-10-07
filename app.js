@@ -580,7 +580,11 @@ function showRoast(id) {
   main.innerHTML = html;
   main.querySelector('#editRoast').addEventListener('click', () => editRoast(r.id));
   main.querySelector('#addTasting').addEventListener('click', () => editTasting(r.id));
-  renderPhotos(r, main.querySelector('#photoBox'));
+  renderPhotos(main.querySelector('#photoBox'), {
+    getIds: () => r.photoIds || [],
+    setIds: ids => { r.photoIds = ids; save(); },
+    deleteNow: true,
+  });
   main.querySelector('#copyCost')?.addEventListener('click', async () => {
     toast(await copyText(costCopyText(r)) ? 'コピーしました。原価計算アプリの「材料」で使ってください' : 'コピーできませんでした');
   });
@@ -698,9 +702,10 @@ function dataUrlToFile(dataUrl, name) {
   return new File([bytes], name, { type: head.match(/:(.*?);/)[1] });
 }
 
-// 写真の並び。押すと大きく、×で消す
-async function renderPhotos(r, box) {
-  const ids = r.photoIds || [];
+// 写真の並び。押すと大きく、×で消す。
+// getIds / setIds で、どの写真の並びかを渡す（焙煎カードの画面ならすぐ保存、入力の画面なら「保存する」で確定）
+async function renderPhotos(box, { getIds, setIds, deleteNow }) {
+  const ids = getIds();
   const photos = (await Promise.all(ids.map(getPhoto))).filter(Boolean);
   box.innerHTML = `
     <div class="photos">
@@ -719,23 +724,21 @@ async function renderPhotos(r, box) {
     toast('写真を保存しています…');
     for (const file of files) {
       try {
-        const photo = { id: newId(), roastId: r.id, date: todayIso(), dataUrl: await shrinkImage(file) };
+        const photo = { id: newId(), date: todayIso(), dataUrl: await shrinkImage(file) };
         await putPhoto(photo);
-        r.photoIds = [...(r.photoIds || []), photo.id];
+        setIds([...getIds(), photo.id]);
       } catch (err) {
         toast('保存できない写真がありました');
       }
     }
-    save();
-    renderPhotos(r, box);
+    renderPhotos(box, { getIds, setIds, deleteNow });
   });
 
   box.querySelectorAll('[data-del]').forEach(btn => btn.addEventListener('click', async () => {
     if (!confirm('この写真を消しますか？')) return;
-    await deletePhoto(btn.dataset.del);
-    r.photoIds = r.photoIds.filter(id => id !== btn.dataset.del);
-    save();
-    renderPhotos(r, box);
+    if (deleteNow) await deletePhoto(btn.dataset.del);
+    setIds(getIds().filter(id => id !== btn.dataset.del));
+    renderPhotos(box, { getIds, setIds, deleteNow });
   }));
 
   box.querySelectorAll('[data-big]').forEach(img => img.addEventListener('click', () => {
@@ -750,7 +753,9 @@ async function renderPhotos(r, box) {
 // どの焙煎カードにも入っていない写真を片づける（焙煎カードを消したときなど）
 async function cleanupPhotos() {
   try {
-    const used = new Set(data.roasts.flatMap(r => r.photoIds || []));
+    let draftIds = [];
+    try { draftIds = JSON.parse(localStorage.getItem(DRAFT_KEY))?.roast?.photoIds || []; } catch (e) { /* 書きかけなし */ }
+    const used = new Set([...data.roasts.flatMap(r => r.photoIds || []), ...draftIds]);
     for (const p of await allPhotos()) if (!used.has(p.id)) await deletePhoto(p.id);
   } catch (e) { /* 片づけられなくても使える */ }
 }
@@ -940,6 +945,7 @@ function editRoast(id) {
   setHeader(isNew ? '新しい焙煎' : '焙煎カードを直す', () => {
     if (dirty && !confirm('入力した内容を保存せずに戻りますか？')) return;
     clearDraft();
+    cleanupPhotos();  // この入力中に追加して、保存しなかった写真を片づける
     leave();
   });
 
@@ -1020,7 +1026,7 @@ function editRoast(id) {
         <div class="field"><label>豆の色</label><input name="color" value="${esc(r.color || '')}" placeholder="例：明るい茶色、ツヤなし"></div>
         <div class="field"><label>ムラ・チャフの様子</label><input name="unevenness" value="${esc(r.unevenness || '')}" placeholder="例：ムラ少し、チャフ多め"></div>
         <div class="field"><label>ひとことメモ</label><textarea name="memo" placeholder="例：香ばしい。1ハゼから2分で終了">${esc(r.memo || '')}</textarea></div>
-        <div class="hint">📷 豆の写真は、保存したあとの焙煎カードの画面で追加できます</div>
+        <div class="field"><label>焙煎後の豆の写真</label><div id="formPhotos"></div></div>
       </div>
     </form>
     <button class="btn primary" id="saveRoast">保存する</button>
@@ -1068,6 +1074,7 @@ function editRoast(id) {
       color: f.color.value.trim(),
       unevenness: f.unevenness.value.trim(),
       memo: f.memo.value.trim(),
+      photoIds: formPhotoIds,
     };
     for (const [key] of EVENTS) next[key] = readEvent(form, key, r[key]);
     return next;
@@ -1122,6 +1129,12 @@ function editRoast(id) {
     const picked = num(form.elements.pickAfterG.value) || 0;
     form.elements.keptG.value = Math.round((out - picked) * 10) / 10;
   };
+  let formPhotoIds = [...(r.photoIds || [])];
+  renderPhotos(main.querySelector('#formPhotos'), {
+    getIds: () => formPhotoIds,
+    setIds: ids => { formPhotoIds = ids; remember(); },
+    deleteNow: false,
+  });
   form.addEventListener('input', autoKeptG);
   form.addEventListener('input', autoInG);
   form.addEventListener('change', e => {
@@ -1246,6 +1259,7 @@ function editRoast(id) {
     }
     save();
     clearDraft();
+    cleanupPhotos();  // 入力の画面で外した写真を片づける
     toast('保存しました');
     showRoast(next.id);
   });
