@@ -60,7 +60,6 @@ const DEFAULT_SETTINGS = {
   roastsPerCan: 10,   // ボンベ1本で焼ける回数
 };
 
-let data = load();
 
 // 以前の初期値（森の仲間）のまま書きかえていなければ、今の初期値（丸いロゴ風）にする
 const OLD_CHARACTER_RULES = `- 世界観：ログハウスのまわりの森にくらす「森の仲間」シリーズ
@@ -71,18 +70,45 @@ const OLD_CHARACTER_RULES = `- 世界観：ログハウスのまわりの森に�
 - お店らしさ：小さなかまど・コーヒーカップ・ハスカップの実などをさりげなく入れる
 - 画像の中に文字は入れない`;
 
+const SAFETY_KEY = 'baisen-v1-safety';  // 開いたときの記録の控え（万一のときに戻せるように）
+let loadFailed = false;  // 記録が読めなかったときは、空の状態で上書きしない
+
 function load() {
+  let raw = null;
+  try { raw = localStorage.getItem(STORE_KEY); } catch (e) { loadFailed = true; }
+  if (!raw) return { beans: [], roasts: [], settings: { ...DEFAULT_SETTINGS } };
+  let saved;
   try {
-    const saved = JSON.parse(localStorage.getItem(STORE_KEY));
+    saved = JSON.parse(raw);
+  } catch (e) {
+    loadFailed = true;
+    return { beans: [], roasts: [], settings: { ...DEFAULT_SETTINGS } };
+  }
+  // 記録が入っていれば、控えを取っておく
+  try { if (saved?.roasts?.length) localStorage.setItem(SAFETY_KEY, raw); } catch (e) { /* 控えが取れなくても使える */ }
+  try {
     if (saved?.settings?.characterRules === OLD_CHARACTER_RULES) delete saved.settings.characterRules;
-    if (saved) return { beans: [], roasts: [], ...saved, settings: { ...DEFAULT_SETTINGS, ...saved.settings } };
-  } catch (e) { /* 読めなければ空から始める */ }
-  return { beans: [], roasts: [], settings: { ...DEFAULT_SETTINGS } };
+  } catch (e) { /* 置きかえられなくても記録は使える */ }
+  return { beans: [], roasts: [], ...saved, settings: { ...DEFAULT_SETTINGS, ...(saved?.settings || {}) } };
 }
 
 function save() {
+  if (loadFailed) {
+    toast('記録が読み込めなかったため、保存を止めました。アプリを開き直してください');
+    return;
+  }
+  // 記録がたくさんあったのに、いきなり空にする保存は止める（読み込みの失敗などで消えないように）
+  try {
+    const before = JSON.parse(localStorage.getItem(STORE_KEY))?.roasts?.length || 0;
+    if (before > 1 && data.roasts.length === 0) {
+      toast('記録が消えてしまうため、保存を止めました');
+      return;
+    }
+  } catch (e) { /* 前の記録が読めなければ、そのまま保存する */ }
   localStorage.setItem(STORE_KEY, JSON.stringify(data));
 }
+
+let data = load();
 
 function newId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -890,6 +916,8 @@ async function renderPhotos(box, { getIds, setIds, deleteNow }) {
 
 // どの焙煎カードにも入っていない写真を片づける（焙煎カードを消したときなど）
 async function cleanupPhotos() {
+  // 記録が1件もないとき（読み込みの失敗も含めて）は片づけない
+  if (loadFailed || !data.roasts.length) return;
   try {
     let draftIds = [];
     try { draftIds = JSON.parse(localStorage.getItem(DRAFT_KEY))?.roast?.photoIds || []; } catch (e) { /* 書きかけなし */ }
