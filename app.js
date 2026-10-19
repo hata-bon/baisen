@@ -614,33 +614,94 @@ function stopVoice() {
   activeVoice = null;
 }
 
-// 声を聞き続ける。onText に聞き取った言葉を渡す。止めるまで、黙って止まっても聞き直す
-function startListening({ onText, onError, onStop }) {
+// 声を聞き続ける。onText に聞き取った言葉を渡す。止めるまで、黙って止まっても聞き直す。
+// アラームや電話でマイクを取られて止まったときも、間をおいて新しく聞き直す。
+// それでも戻らないとき（iPhoneはボタンを押さないとマイクを再開できないことがある）は onPause で知らせ、
+// 次にボタンが押されたとき（resume）に再開する
+function startListening({ onText, onError, onStop, onPause = () => {}, onResume = () => {} }) {
   stopVoice();
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) { onError('このスマホ・ブラウザでは声の入力が使えません。Safariで試してください'); return null; }
-  const rec = new SR();
-  rec.lang = 'ja-JP';
-  rec.continuous = true;
-  rec.interimResults = false;
-  let on = true;
-  rec.onresult = e => {
-    for (let k = e.resultIndex; k < e.results.length; k++) {
-      if (e.results[k].isFinal) onText(e.results[k][0].transcript.trim());
-    }
-  };
-  rec.onerror = e => {
-    if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+  let on = true, rec = null, retries = 0, retryTimer = null, lastActivity = Date.now();
+
+  const handle = {
+    paused: false,
+    stop: () => {
       on = false;
-      onError('マイクが使えません。iPhoneの「設定」でマイクを許可してください');
-    }
+      clearTimeout(retryTimer); clearInterval(watchdog);
+      try { rec?.abort(); } catch (err) { /* もう止まっている */ }
+      rec = null;
+      onStop();
+    },
+    // ボタンが押されたときや、アプリに戻ったときに呼ぶ
+    resume: () => { if (on) { retries = 0; launch(); } },
   };
-  const handle = { stop: () => { on = false; try { rec.stop(); } catch (err) { /* もう止まっている */ } onStop(); } };
-  rec.onend = () => { if (on && activeVoice === handle) { try { rec.start(); } catch (err) { /* すぐ次で再開 */ } } else onStop(); };
+
+  const scheduleRetry = () => {
+    if (!on) return;
+    clearTimeout(retryTimer);
+    retries++;
+    if (retries > 5) {
+      if (!handle.paused) { handle.paused = true; onPause(); }
+      return;
+    }
+    retryTimer = setTimeout(launch, Math.min(600 * retries, 3000));
+  };
+
+  const launch = () => {
+    if (!on) return;
+    clearTimeout(retryTimer);
+    const old = rec;
+    rec = null;
+    try { old?.abort(); } catch (err) { /* もう止まっている */ }
+    const me = new SR();
+    rec = me;
+    me.lang = 'ja-JP';
+    me.continuous = true;
+    me.interimResults = false;
+    let started = false;
+    const alive = () => { lastActivity = Date.now(); };
+    me.onstart = () => {
+      started = true; retries = 0; alive();
+      if (handle.paused) { handle.paused = false; onResume(); }
+    };
+    me.onaudiostart = alive;
+    me.onspeechstart = alive;
+    me.onresult = e => {
+      alive();
+      for (let k = e.resultIndex; k < e.results.length; k++) {
+        if (e.results[k].isFinal) onText(e.results[k][0].transcript.trim());
+      }
+    };
+    me.onerror = e => {
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+        // 一度は許可されていたのに断られたときは、マイクを取られている途中のことが多い
+        if (started || retries > 0) return;
+        on = false;
+        onError('マイクが使えません。iPhoneの「設定」でマイクを許可してください');
+        handle.stop();
+      }
+    };
+    me.onend = () => { if (rec === me && on && activeVoice === handle) scheduleRetry(); };
+    try { me.start(); } catch (err) { scheduleRetry(); return; }
+    // 始まったはずなのに4秒たっても動かなければ、もう一度
+    setTimeout(() => { if (rec === me && on && !started) scheduleRetry(); }, 4000);
+  };
+
+  // 50秒なにも聞こえないときは、止まっていても気づけるように聞き直しておく
+  const watchdog = setInterval(() => {
+    if (on && !handle.paused && Date.now() - lastActivity > 50000) { lastActivity = Date.now(); launch(); }
+  }, 10000);
+
   activeVoice = handle;
-  rec.start();
+  launch();
   return handle;
 }
+
+// アラームなどのあとでアプリに戻ったら、声の入力を再開する
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && activeVoice) activeVoice.resume();
+});
 
 // 「百六十五」「165」「１６５」などを数にする
 function parseJaNumber(text) {
@@ -1274,14 +1335,24 @@ function editRoast(id) {
   };
 
   voiceBtn.addEventListener('click', () => {
+    if (activeVoice?.paused) { activeVoice.resume(); return; }
     if (activeVoice) { stopVoice(); return; }
     const finish = () => {
-      voiceBtn.classList.remove('on');
+      voiceBtn.classList.remove('on', 'paused');
       voiceBtn.textContent = '🎤 声で温度を入れる';
     };
-    if (!startListening({ onText: onHeard, onError: msg => say(msg, false), onStop: finish })) return;
-    voiceBtn.classList.add('on');
-    voiceBtn.textContent = '⏹ 声の入力を止める';
+    const listening = () => {
+      voiceBtn.classList.remove('paused'); voiceBtn.classList.add('on');
+      voiceBtn.textContent = '⏹ 声の入力を止める';
+    };
+    const paused = () => {
+      voiceBtn.classList.remove('on'); voiceBtn.classList.add('paused');
+      voiceBtn.textContent = '🎤 押して声の入力を再開';
+      beep(2);
+      say('声の入力が止まりました（アラームなどのため）。ボタンを押すと再開します', false);
+    };
+    if (!startListening({ onText: onHeard, onError: msg => say(msg, false), onStop: finish, onPause: paused, onResume: () => { listening(); say('声の入力を再開しました'); } })) return;
+    listening();
     say('聞いています。「165」や「3分 165」のように言ってください');
   });
 
@@ -1513,12 +1584,28 @@ function editRoast(id) {
       if (got.minute != null) mode = { kind: 'minute', i: got.minute };
       record(got.temp);
     };
-    micBtn.addEventListener('click', () => {
-      if (activeVoice) { stopVoice(); return; }
-      const off = () => { micBtn.classList.remove('on'); micBtn.textContent = '🎤 声で入れる'; };
-      if (!startListening({ onText, onError: m => msg(m, false), onStop: off })) return;
-      micBtn.classList.add('on');
+    const micListening = () => {
+      micBtn.classList.remove('paused'); micBtn.classList.add('on');
       micBtn.textContent = '⏹ 声を止める（「165」「1ハゼ」「煎り止め」など）';
+    };
+    micBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      if (activeVoice?.paused) { activeVoice.resume(); return; }
+      if (activeVoice) { stopVoice(); return; }
+      const off = () => { micBtn.classList.remove('on', 'paused'); micBtn.textContent = '🎤 声で入れる'; };
+      const paused = () => {
+        micBtn.classList.remove('on'); micBtn.classList.add('paused');
+        micBtn.textContent = '🎤 声が止まりました。押すと再開';
+        beep(2);
+        msg('声の入力が止まりました（アラームなどのため）。どれかのボタンを押すと再開します', false);
+      };
+      const resumed = () => { micListening(); msg('声の入力を再開しました'); };
+      if (!startListening({ onText, onError: m => msg(m, false), onStop: off, onPause: paused, onResume: resumed })) return;
+      micListening();
+    });
+    // 声が止まっているときは、タイマーの画面のどのボタンを押しても再開する（iPhoneはボタンを押したときしかマイクを再開できない）
+    view.addEventListener('click', e => {
+      if (e.target.closest('button') && activeVoice?.paused) activeVoice.resume();
     });
 
     const close = () => {

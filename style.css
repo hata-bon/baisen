@@ -305,3 +305,4 @@ textarea:focus { outline: 2px solid var(--brand); border-color: transparent; }
 
 /* hidden を付けたものは、見た目の指定より優先して隠す */
 [hidden] { display: none !important; }
+.btn.voice.paused, .tv-mic.paused { background: #e8a33a; border-color: #e8a33a; color: #fff; }
