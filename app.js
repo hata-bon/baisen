@@ -41,6 +41,14 @@ const SEED_BEANS = {
 
 const DEFAULT_SETTINGS = {
   gasCanPrice: null,  // カセットガスのボンベ1本の値段（円・税込）
+  // キャラクターのシリーズの共通ルール（毎回のプロンプトに入れる）
+  characterRules: `- 世界観：ログハウスのまわりの森にくらす「森の仲間」シリーズ
+- 絵のタッチ：やさしい水彩風のイラスト、あたたかい色合い
+- 頭身：2〜3頭身のかわいいキャラクター
+- キャラクターの形：コーヒー豆が森の動物（リス、クマなど）の姿をしている
+- 背景：ログハウスのまわりの森、木もれ日
+- お店らしさ：小さなかまど・コーヒーカップ・ハスカップの実などをさりげなく入れる
+- 画像の中に文字は入れない`,
   roastsPerCan: 10,   // ボンベ1本で焼ける回数
 };
 
@@ -576,6 +584,7 @@ function showRoast(id) {
     <div class="card" id="photoBox"></div>
     ${tastingsHtml(r)}
     ${aiReviewHtml(r)}
+    ${characterHtml(r)}
     <button class="btn primary" id="editRoast">この焙煎カードを直す</button>`;
 
   if (r.imported) {
@@ -602,6 +611,24 @@ function showRoast(id) {
   });
   main.querySelectorAll('[data-tasting]').forEach(el => {
     el.addEventListener('click', () => editTasting(r.id, el.dataset.tasting));
+  });
+
+  renderPhotos(main.querySelector('#charImages'), {
+    getIds: () => r.characterIds || [],
+    setIds: ids => { r.characterIds = ids; save(); },
+    deleteNow: true,
+  });
+  main.querySelector('#askChar').addEventListener('click', () => shareToClaude(r, characterPrompt(r), `キャラクター ${r.lot}`));
+  main.querySelector('#saveChar').addEventListener('click', () => {
+    const text = main.querySelector('#charText').value.trim();
+    r.character = text ? { text, name: characterName(text), date: todayIso() } : null;
+    save();
+    toast(text ? 'キャラクターを保存しました' : 'キャラクターの答えを消しました');
+    showRoast(r.id);
+  });
+  main.querySelector('#copyGemini').addEventListener('click', async () => {
+    const ok = await copyText(geminiPart(r.character?.text || ''));
+    toast(ok ? 'コピーしました。Geminiアプリに貼り付けてください' : 'コピーできませんでした');
   });
 }
 
@@ -848,7 +875,7 @@ async function cleanupPhotos() {
   try {
     let draftIds = [];
     try { draftIds = JSON.parse(localStorage.getItem(DRAFT_KEY))?.roast?.photoIds || []; } catch (e) { /* 書きかけなし */ }
-    const used = new Set([...data.roasts.flatMap(r => r.photoIds || []), ...draftIds]);
+    const used = new Set([...data.roasts.flatMap(r => [...(r.photoIds || []), ...(r.characterIds || [])]), ...draftIds]);
     for (const p of await allPhotos()) if (!used.has(p.id)) await deletePhoto(p.id);
   } catch (e) { /* 片づけられなくても使える */ }
 }
@@ -913,11 +940,15 @@ async function copyText(text) {
 
 // 共有画面で、記録の文章と写真をまとめて Claude アプリへ。文章は念のためコピーもしておく
 async function askAi(r) {
-  const text = aiPrompt(r);
+  return shareToClaude(r, aiPrompt(r), `焙煎の評価 ${r.lot}`);
+}
+
+// 文章と焙煎後の豆の写真を、共有画面で Claude アプリへ。文章は念のためコピーもしておく
+async function shareToClaude(r, text, title) {
   const copied = await copyText(text);
   const photos = (await Promise.all((r.photoIds || []).map(getPhoto))).filter(Boolean);
   const files = photos.map((p, i) => dataUrlToFile(p.dataUrl, `${r.lot}_${i + 1}.jpg`));
-  const share = { text, title: `焙煎の評価 ${r.lot}` };
+  const share = { text, title };
   if (files.length && navigator.canShare?.({ files })) share.files = files;
   if (navigator.share) {
     try {
@@ -928,6 +959,71 @@ async function askAi(r) {
     }
   }
   toast(copied ? '記録をコピーしました。Claudeアプリに貼り付けてください' : 'コピーできませんでした');
+}
+
+// ---------- 焙煎豆のキャラクター（Claudeに考えてもらい、Geminiで画像にする） ----------
+
+const PROMPT_START = '【Gemini用プロンプト】', PROMPT_END = '【ここまで】';
+
+function characterPrompt(r) {
+  const bean = data.beans.find(b => b.id === r.beanId) || {};
+  const loss = lossRate(r);
+  const level = r.level || r.noteLevel || roastLevel(loss);
+  const info = ROAST_INFO[roastLevel(loss)];
+  const line = (k, v) => (v == null || v === '' ? '' : `- ${k}：${v}\n`);
+  const tastings = (r.tastings || []).map(t => {
+    const scores = TASTE_ITEMS.map(([k, label]) => (t[k] ? `${label}${t[k]}` : '')).filter(Boolean).join('・');
+    return `- ${scores}／総合${t.total || '―'}/5${t.memo ? `／「${t.memo}」` : ''}`;
+  }).join('\n');
+  const others = data.roasts
+    .filter(x => x.id !== r.id && x.character?.name)
+    .map(x => `- ${x.character.name}（${beanName(x.beanId)}）`)
+    .filter((v, i, a) => a.indexOf(v) === i).slice(0, 10).join('\n');
+
+  return `コーヒー豆のキャラクターを考えてください。自家焙煎のコーヒー豆に、袋やメニュー、SNSで添えるキャラクターです。
+添付の写真は、今回焙煎した豆です。
+
+【シリーズの共通ルール】（必ず守ってください）
+${data.settings.characterRules || DEFAULT_SETTINGS.characterRules}
+
+【この豆のこと】
+${line('豆', bean.name)}${line('産地', [bean.country, bean.region, bean.farm].filter(Boolean).join(' '))}${line('品種', bean.variety)}${line('精製方法', bean.process)}${line('焙煎度', level)}${line('減り率から見た一般的な焙煎度', info ? `${roastLevel(loss)}（${info.depth}：${info.taste}）` : '')}${line('減り率', loss == null ? '' : `${loss.toFixed(1)}%`)}${line('メモ', r.memo)}${line('豆のメモ', bean.memo)}${tastings ? `\n【味見】\n${tastings}\n` : ''}${r.aiReview?.text ? `\n【AIの評価（抜粋）】\n${r.aiReview.text.slice(0, 600)}\n` : ''}${others ? `\n【これまでの仲間（かぶらないように）】\n${others}\n` : ''}
+答えてほしいこと：
+1. キャラクターの名前（産地や味にちなんだ、呼びやすい名前）
+2. 設定：性格・見た目・色・持ち物・背景。味と香りの特徴を、どこにどう表したかも一言ずつ
+3. 袋やメニューに添える、キャラクターのひとこと（20字くらい）
+4. 画像生成AI（Gemini）にそのまま貼れるプロンプト。共通ルールを必ず入れて、日本語で。
+   アプリで取り出せるように、プロンプトだけを「${PROMPT_START}」の次の行から「${PROMPT_END}」の前の行までに書いてください。
+5. 同じ内容の英語のプロンプト（Geminiでうまくいかないときの予備）
+`;
+}
+
+// 貼り付けた答えから、Gemini用のプロンプトの部分だけを取り出す
+function geminiPart(text) {
+  const a = text.indexOf(PROMPT_START), b = text.indexOf(PROMPT_END, a + 1);
+  if (a < 0 || b < 0) return text.trim();
+  return text.slice(a + PROMPT_START.length, b).replace(/^[\s`]+|[\s`]+$/g, '').trim();
+}
+
+// 答えの「名前」の行を拾う（一覧やほかのキャラクターとかぶらないようにするため）
+function characterName(text) {
+  return text.match(/名前[^\n：:]*[：:]\s*\**\s*([^\n*（(]+)/)?.[1]?.trim().slice(0, 20) || '';
+}
+
+function characterHtml(r) {
+  const c = r.character;
+  return `
+    <h2>キャラクター</h2>
+    <div class="card">
+      ${c?.name ? `<div class="name" style="margin-bottom:8px">🐿 ${esc(c.name)}</div>` : ''}
+      <div id="charImages"></div>
+      <button class="btn primary ai" id="askChar" style="margin-top:12px">🎨 キャラクターを考えてもらう</button>
+      <div class="hint">① 共有画面で「Claude」を選んで送る → ② 返ってきた答えを下に貼り付けて保存 → ③「Gemini用にコピー」を押して、Geminiアプリに貼って画像を作る → ④ できた画像を長押しで保存して、上の📷から追加</div>
+      <div class="field" style="margin-top:14px"><label>Claudeの答え（設定とプロンプト）</label>
+        <textarea id="charText" placeholder="Claudeの答えをコピーして、ここに貼り付け">${esc(c?.text || '')}</textarea></div>
+      <button class="btn ghost" id="saveChar">キャラクターの答えを保存する</button>
+      <button class="btn ghost" id="copyGemini" ${c?.text ? '' : 'hidden'}>📋 Gemini用にコピー</button>
+    </div>`;
 }
 
 function aiReviewHtml(r) {
@@ -1979,6 +2075,13 @@ function renderSettings() {
         : `<button class="btn primary" id="importSeed">過去の記録（9回分）を取り込む</button>`}
     </div>
 
+    <h2>キャラクターの共通ルール</h2>
+    <div class="card">
+      <div class="note">「🎨 キャラクターを考えてもらう」で、毎回Claudeに渡すルールです。豆が変わっても、同じシリーズの仲間になるようにします。</div>
+      <textarea id="characterRules" style="min-height:190px;margin-top:8px">${esc(data.settings.characterRules ?? DEFAULT_SETTINGS.characterRules)}</textarea>
+      <button class="btn ghost" id="resetRules">最初のルールに戻す</button>
+    </div>
+
     <h2>ガス代（原価の計算に使います）</h2>
     <div class="card">
       <div class="field"><label>カセットガスのボンベ1本の値段（税込）</label>
@@ -2012,6 +2115,17 @@ function renderSettings() {
     gasPreview();
   }));
   gasPreview();
+
+  main.querySelector('#characterRules').addEventListener('input', e => {
+    data.settings.characterRules = e.target.value;
+    save();
+  });
+  main.querySelector('#resetRules').addEventListener('click', () => {
+    if (!confirm('キャラクターの共通ルールを最初の内容に戻しますか？')) return;
+    data.settings.characterRules = DEFAULT_SETTINGS.characterRules;
+    save();
+    showTab('settings');
+  });
 
   main.querySelector('#exportData').addEventListener('click', exportData);
   const file = main.querySelector('#importFile');
