@@ -18,6 +18,11 @@ const ROAST_LEVELS = [
 ];
 
 // 焙煎度ごとの減り率の目安・呼び方・味わいの傾向
+const ROAST_EN = {
+  ライト: 'LIGHT', シナモン: 'CINNAMON', ミディアム: 'MEDIUM', ハイ: 'HIGH',
+  シティ: 'CITY', フルシティ: 'FULL CITY', フレンチ: 'FRENCH', イタリアン: 'ITALIAN',
+};
+
 const ROAST_INFO = {
   ライト: { range: '11〜13%', depth: '極浅煎り', taste: '穀物っぽさが残る、酸味が強い' },
   シナモン: { range: '13〜14%', depth: '浅煎り', taste: 'すっきりした酸味' },
@@ -42,21 +47,34 @@ const SEED_BEANS = {
 const DEFAULT_SETTINGS = {
   gasCanPrice: null,  // カセットガスのボンベ1本の値段（円・税込）
   // キャラクターのシリーズの共通ルール（毎回のプロンプトに入れる）
-  characterRules: `- 世界観：ログハウスのまわりの森にくらす「森の仲間」シリーズ
-- 絵のタッチ：やさしい水彩風のイラスト、あたたかい色合い
-- 頭身：2〜3頭身のかわいいキャラクター
-- キャラクターの形：コーヒー豆が森の動物（リス、クマなど）の姿をしている
-- 背景：ログハウスのまわりの森、木もれ日
-- お店らしさ：小さなかまど・コーヒーカップ・ハスカップの実などをさりげなく入れる
-- 画像の中に文字は入れない`,
+  characterRules: `- 形：丸いステッカー（ロゴ・バッジ）風。白い背景に、外側は濃い緑のリング、リングの中の文字は金色
+- リングの上側の文字：産地・豆の名前・等級を英語の大文字で（例：INDONESIA MANDHELING G1）
+- リングの下側の文字：焙煎度を英語と日本語で（例：ROASTED FOR FULL CITY・フルシティ焙煎）
+- キャラクター：コーヒー豆そのものに顔と手足がついた姿。2〜3頭身、やさしい表情
+- 服装・持ち物：産地の文化をとり入れる（例：インドネシアならバティック柄のはちまきと腰布）。ドリップコーヒーを淹れている、または飲んでいる
+- 円の中の背景：産地の風景（山・森・農園など）
+- リボン：キャラクターの愛称（カタカナ）のリボンと、豆の名前（英語）のリボン
+- 小物：等級や豆の名前を書いた木の道しるべ、焙煎を表す小さなアイコン（水滴・タイマー・炎など）
+- 絵のタッチ：手描き風のイラスト、くっきりした線、落ち着いた色合い
+- 画像に入れる文字は、プロンプトの中に「」でそのまま書く（つづりをまちがえないように。日本語は短く）`,
   roastsPerCan: 10,   // ボンベ1本で焼ける回数
 };
 
 let data = load();
 
+// 以前の初期値（森の仲間）のまま書きかえていなければ、今の初期値（丸いロゴ風）にする
+const OLD_CHARACTER_RULES = `- 世界観：ログハウスのまわりの森にくらす「森の仲間」シリーズ
+- 絵のタッチ：やさしい水彩風のイラスト、あたたかい色合い
+- 頭身：2〜3頭身のかわいいキャラクター
+- キャラクターの形：コーヒー豆が森の動物（リス、クマなど）の姿をしている
+- 背景：ログハウスのまわりの森、木もれ日
+- お店らしさ：小さなかまど・コーヒーカップ・ハスカップの実などをさりげなく入れる
+- 画像の中に文字は入れない`;
+
 function load() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORE_KEY));
+    if (saved?.settings?.characterRules === OLD_CHARACTER_RULES) delete saved.settings.characterRules;
     if (saved) return { beans: [], roasts: [], ...saved, settings: { ...DEFAULT_SETTINGS, ...saved.settings } };
   } catch (e) { /* 読めなければ空から始める */ }
   return { beans: [], roasts: [], settings: { ...DEFAULT_SETTINGS } };
@@ -970,6 +988,8 @@ function characterPrompt(r) {
   const loss = lossRate(r);
   const level = r.level || r.noteLevel || roastLevel(loss);
   const info = ROAST_INFO[roastLevel(loss)];
+  // ロゴに書く焙煎度の名前（自分の判断 → 目指した焙煎度 → 減り率の目安 の順）
+  const logoLevel = [r.level, r.targetLevel, roastLevel(loss)].find(v => ROAST_EN[v]);
   const line = (k, v) => (v == null || v === '' ? '' : `- ${k}：${v}\n`);
   const tastings = (r.tastings || []).map(t => {
     const scores = TASTE_ITEMS.map(([k, label]) => (t[k] ? `${label}${t[k]}` : '')).filter(Boolean).join('・');
@@ -987,12 +1007,12 @@ function characterPrompt(r) {
 ${data.settings.characterRules || DEFAULT_SETTINGS.characterRules}
 
 【この豆のこと】
-${line('豆', bean.name)}${line('産地', [bean.country, bean.region, bean.farm].filter(Boolean).join(' '))}${line('品種', bean.variety)}${line('精製方法', bean.process)}${line('焙煎度', level)}${line('減り率から見た一般的な焙煎度', info ? `${roastLevel(loss)}（${info.depth}：${info.taste}）` : '')}${line('減り率', loss == null ? '' : `${loss.toFixed(1)}%`)}${line('メモ', r.memo)}${line('豆のメモ', bean.memo)}${tastings ? `\n【味見】\n${tastings}\n` : ''}${r.aiReview?.text ? `\n【AIの評価（抜粋）】\n${r.aiReview.text.slice(0, 600)}\n` : ''}${others ? `\n【これまでの仲間（かぶらないように）】\n${others}\n` : ''}
+${line('豆', bean.name)}${line('産地', [bean.country, bean.region, bean.farm].filter(Boolean).join(' '))}${line('品種', bean.variety)}${line('等級', bean.grade)}${line('精製方法', bean.process)}${line('焙煎度', level)}${line('ロゴに書く焙煎度', logoLevel ? `${ROAST_EN[logoLevel]}（${logoLevel}）` : '')}${line('減り率から見た一般的な焙煎度', info ? `${roastLevel(loss)}（${info.depth}：${info.taste}）` : '')}${line('減り率', loss == null ? '' : `${loss.toFixed(1)}%`)}${line('メモ', r.memo)}${line('豆のメモ', bean.memo)}${tastings ? `\n【味見】\n${tastings}\n` : ''}${r.aiReview?.text ? `\n【AIの評価（抜粋）】\n${r.aiReview.text.slice(0, 600)}\n` : ''}${others ? `\n【これまでの仲間（かぶらないように）】\n${others}\n` : ''}
 答えてほしいこと：
 1. キャラクターの名前（産地や味にちなんだ、呼びやすい名前）
 2. 設定：性格・見た目・色・持ち物・背景。味と香りの特徴を、どこにどう表したかも一言ずつ
 3. 袋やメニューに添える、キャラクターのひとこと（20字くらい）
-4. 画像生成AI（Gemini）にそのまま貼れるプロンプト。共通ルールを必ず入れて、日本語で。
+4. 画像生成AI（Gemini）にそのまま貼れるプロンプト。共通ルールを必ず入れて、日本語で。画像に入れる文字（リングの上下・リボン・看板）は、つづりまで正確にプロンプトの中に書いてください。
    アプリで取り出せるように、プロンプトだけを「${PROMPT_START}」の次の行から「${PROMPT_END}」の前の行までに書いてください。
 5. 同じ内容の英語のプロンプト（Geminiでうまくいかないときの予備）
 `;
