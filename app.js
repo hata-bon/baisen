@@ -89,6 +89,7 @@ function load() {
   try {
     if (saved?.settings?.characterRules === OLD_CHARACTER_RULES) delete saved.settings.characterRules;
   } catch (e) { /* 置きかえられなくても記録は使える */ }
+  try { migratePurchases(saved); } catch (e) { /* 移しかえられなくても記録は使える */ }
   return { beans: [], roasts: [], ...saved, settings: { ...DEFAULT_SETTINGS, ...(saved?.settings || {}) } };
 }
 
@@ -506,6 +507,118 @@ function curveSvg(r, plan, nowSec = null) {
     </div>`;
 }
 
+// ---------- 生豆の仕入れ ----------
+// 同じ豆でも、買うたびに値段や収穫年・仕入れ先がちがうので、豆の中に「仕入れ」を何回分も持たせる（bean.purchases）。
+// 焙煎カードは、どの仕入れの豆を使ったか（r.purchaseId）を覚える。原価はその仕入れの値段で計算する
+
+// 以前の「豆に1つだけの値段・購入先・購入日」を、最初の仕入れにする（読み込んだときに1回だけ）
+function migratePurchases(d) {
+  for (const b of d.beans || []) {
+    if (Array.isArray(b.purchases)) continue;
+    b.purchases = [];
+    if (b.pricePerKg != null || b.shop || b.purchaseDate) {
+      const p = { id: `p${b.id}`, date: b.purchaseDate || '', shop: b.shop || '', pricePerKg: b.pricePerKg ?? null, qtyKg: null, memo: '' };
+      b.purchases.push(p);
+      for (const r of d.roasts || []) if (r.beanId === b.id && !r.purchaseId) r.purchaseId = p.id;
+    }
+  }
+}
+
+// 新しい順の仕入れ
+function purchasesOf(bean) {
+  return [...(bean?.purchases || [])].sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+}
+
+function purchaseOf(r) {
+  const bean = data.beans.find(b => b.id === r.beanId);
+  return bean?.purchases?.find(p => p.id === r.purchaseId) || null;
+}
+
+function purchaseLabel(p) {
+  if (!p) return '';
+  return [p.date ? fmtDate(p.date) : '購入日なし', p.shop, p.pricePerKg ? `${Number(p.pricePerKg).toLocaleString()}円/kg` : ''].filter(Boolean).join('・');
+}
+
+// 仕入れの豆を、焙煎で使った量（ハンドピックで除いた分も含む）
+function usedGreenG(purchaseId) {
+  return data.roasts
+    .filter(r => r.purchaseId === purchaseId)
+    .reduce((sum, r) => sum + (num(r.greenG) ?? ((num(r.inG) || 0) + (num(r.pickBeforeG) || 0))), 0);
+}
+
+function purchaseStockText(p) {
+  const used = usedGreenG(p.id);
+  if (!num(p.qtyKg)) return used ? `使った量 ${g(used)}` : '';
+  const left = num(p.qtyKg) * 1000 - used;
+  return `使った量 ${g(used)}・残り約 ${g(Math.max(0, Math.round(left)))}`;
+}
+
+function editPurchase(beanId, purchaseId) {
+  const bean = data.beans.find(b => b.id === beanId);
+  if (!bean) return showTab('beans');
+  const p = bean.purchases?.find(x => x.id === purchaseId) || { date: todayIso() };
+  const isNew = !p.id;
+  setHeader(isNew ? '仕入れを追加' : '仕入れを直す', () => editBean(beanId));
+  const used = data.roasts.filter(r => r.purchaseId === p.id).length;
+  main.innerHTML = `
+    <div class="card"><div class="name">${esc(bean.name)}</div></div>
+    <form class="card" id="purchaseForm">
+      <div class="field"><label>購入日</label><input name="date" type="date" value="${esc(p.date || '')}"></div>
+      <div class="field"><label>購入先</label><input name="shop" value="${esc(p.shop || '')}" placeholder="例：○○珈琲"></div>
+      <div class="field"><label>1kgあたりの値段（円・税込）</label>
+        <div class="inline"><input name="pricePerKg" inputmode="numeric" value="${p.pricePerKg ?? ''}" placeholder="例：3200"><span class="unit">円/kg</span></div>
+        <div class="hint">送料もふくめるなら、合計を買った量で割った値段を入れてください</div></div>
+      <div class="field"><label>買った量</label>
+        <div class="inline"><input name="qtyKg" inputmode="decimal" value="${p.qtyKg ?? ''}" placeholder="例：1"><span class="unit">kg</span></div>
+        ${p.id && purchaseStockText(p) ? `<div class="hint">${purchaseStockText(p)}</div>` : ''}</div>
+      <div class="field"><label>メモ（収穫年・ロット番号・販売店の説明など）</label>
+        <textarea name="memo" placeholder="例：2025-26年クロップ。前回よりやや小粒">${esc(p.memo || '')}</textarea></div>
+    </form>
+    <button class="btn primary" id="savePurchase">保存する</button>
+    ${isNew ? '' : `<button class="btn danger" id="delPurchase">${used ? `この仕入れは${used}回の焙煎で使われているので消せません` : 'この仕入れを消す'}</button>`}`;
+
+  main.querySelector('#savePurchase').addEventListener('click', () => {
+    const f = main.querySelector('#purchaseForm').elements;
+    const next = {
+      ...p,
+      id: p.id || newId(),
+      date: f.date.value,
+      shop: f.shop.value.trim(),
+      pricePerKg: num(f.pricePerKg.value),
+      qtyKg: num(f.qtyKg.value),
+      memo: f.memo.value.trim(),
+    };
+    bean.purchases = [...(bean.purchases || []).filter(x => x.id !== next.id), next];
+    save();
+    toast('保存しました');
+    editBean(beanId);
+  });
+  main.querySelector('#delPurchase')?.addEventListener('click', () => {
+    if (used) return;
+    if (!confirm('この仕入れを消しますか？')) return;
+    bean.purchases = bean.purchases.filter(x => x.id !== p.id);
+    save();
+    editBean(beanId);
+  });
+}
+
+function purchasesHtml(bean) {
+  const list = purchasesOf(bean);
+  return `
+    <h2>仕入れ（買うたびに追加）</h2>
+    ${list.map((p, i) => `
+      <button class="card" data-purchase="${p.id}">
+        <div class="row">
+          <div class="name" style="font-size:15px">${p.date ? fmtDate(p.date) : '購入日なし'}${i === 0 ? ' <span class="badge">いちばん新しい</span>' : ''}</div>
+          ${p.pricePerKg ? `<span class="big" style="font-size:17px">${Number(p.pricePerKg).toLocaleString()}<small style="font-size:12px">円/kg</small></span>` : ''}
+        </div>
+        <div class="sub">${[p.shop, p.qtyKg ? `${p.qtyKg}kg` : '', `焙煎 ${data.roasts.filter(r => r.purchaseId === p.id).length}回`].filter(Boolean).map(esc).join('・')}</div>
+        ${purchaseStockText(p) ? `<div class="sub">${esc(purchaseStockText(p))}</div>` : ''}
+        ${p.memo ? `<div class="sub">${esc(p.memo)}</div>` : ''}
+      </button>`).join('') || '<div class="card"><div class="note">まだ仕入れが登録されていません。値段を入れると、焙煎豆の原価が出ます。</div></div>'}
+    <button class="btn ghost" id="addPurchase">＋ 仕入れを追加</button>`;
+}
+
 // ---------- 焙煎豆の原価 ----------
 // 生豆代（ハンドピックで除いた分も含めて、使った生豆すべて）＋ガス代 を、焙煎後に残った量で割る。
 // ドリップ1杯の原価と売値は、原価計算アプリで「焙煎豆」を材料として使って決める
@@ -522,7 +635,7 @@ function gasPerRoast() {
 
 function roastCost(r) {
   const bean = data.beans.find(b => b.id === r.beanId);
-  const pricePerKg = num(bean?.pricePerKg);
+  const pricePerKg = num(purchaseOf(r)?.pricePerKg ?? (bean?.purchases?.length ? null : bean?.pricePerKg));
   const greenUsed = num(r.greenG) ?? (num(r.inG) != null ? num(r.inG) + (num(r.pickBeforeG) || 0) : null);
   const yieldG = usableG(r) ?? num(r.outG);
   const missing = [];
@@ -539,7 +652,7 @@ function roastCost(r) {
 function costHtml(r) {
   const c = roastCost(r);
   if (c.missing) {
-    return `<h2>原価</h2><div class="card"><div class="note">${c.missing.join('・')}が入ると、焙煎豆の原価が出ます。${c.missing.includes('生豆の1kgあたりの値段') ? '値段は「🫘 生豆」で入れられます。' : ''}</div></div>`;
+    return `<h2>原価</h2><div class="card"><div class="note">${c.missing.join('・')}が入ると、焙煎豆の原価が出ます。${c.missing.includes('生豆の1kgあたりの値段') ? (r.purchaseId ? '値段は「🫘 生豆」の、この仕入れで入れられます。' : '「直す」で、使った仕入れを選んでください（仕入れは「🫘 生豆」で登録できます）。') : ''}</div></div>`;
   }
   const dose = latestTasting(r)?.doseG || 15;
   return `
@@ -600,6 +713,7 @@ function showRoast(id) {
 
     <h2>焙煎の前</h2>
     <div class="card">${kvRows([
+      opt('仕入れ', purchaseOf(r) ? `${esc(purchaseLabel(purchaseOf(r)))}${purchaseOf(r).memo ? `<div class="hint">${esc(purchaseOf(r).memo)}</div>` : ''}` : null),
       opt('量った生豆', r.greenG != null ? g(r.greenG) : null),
       opt('ハンドピック（前）', r.pickBeforeG != null ? `${g(r.pickBeforeG)} 除いた` : null),
       ['投入量', g(r.inG)],
@@ -973,7 +1087,7 @@ function aiPrompt(r) {
 専門用語には一言で説明を添えて、わかりやすく答えてください。
 
 【生豆】
-${line('名前', bean.name)}${line('産地', [bean.country, bean.region, bean.farm].filter(Boolean).join(' '))}${line('品種', bean.variety)}${line('等級', bean.grade)}${line('精製方法', bean.process)}${line('メモ', bean.memo)}
+${line('名前', bean.name)}${line('産地', [bean.country, bean.region, bean.farm].filter(Boolean).join(' '))}${line('品種', bean.variety)}${line('等級', bean.grade)}${line('精製方法', bean.process)}${line('メモ', bean.memo)}${purchaseOf(r) ? line('仕入れ', `${purchaseLabel(purchaseOf(r))}${purchaseOf(r).memo ? `（${purchaseOf(r).memo}）` : ''}`) : ''}
 【焙煎の前】
 ${line('焙煎日', r.date)}${line('ロット', r.lot)}${line('投入量', r.inG != null ? `${r.inG}g` : '')}${line('ハンドピックで除いた量', r.pickBeforeG != null ? `${r.pickBeforeG}g` : '')}${line('目指した焙煎度', r.targetLevel)}${line('予熱して投入', r.preheat ? `あり${r.chargeTemp != null ? `（投入温度${r.chargeTemp}℃）` : ''}` : 'なし')}${line('気温・天気', [r.airTemp != null ? `${r.airTemp}℃` : '', r.weather].filter(Boolean).join('・'))}${plan ? line('目標', `1ハゼ ${fmtTime(plan.fc.sec)}・${plan.fc.temp}℃ → 煎り止め ${fmtTime(plan.drop.sec)}・${plan.drop.temp}℃`) : ''}
 【焙煎の最中】
@@ -1118,6 +1232,7 @@ function roastDigest(x, detail) {
   const ev = e => (e && (e.sec != null || e.temp != null || e.text) ? fmtEvent(e).replace(/<[^>]+>/g, '') : '');
   const parts = [
     `${x.date}（ロット${x.lot}）`,
+    purchaseOf(x) ? `仕入れ：${purchaseLabel(purchaseOf(x))}` : '',
     x.inG != null ? `投入${x.inG}g` : '',
     x.preheat ? `予熱あり${x.chargeTemp != null ? `・投入温度${x.chargeTemp}℃` : ''}` : '予熱なし',
     x.targetLevel ? `目指した焙煎度：${x.targetLevel}` : '',
@@ -1165,8 +1280,11 @@ function aiLevelsPrompt(bean) {
 ${ROAST_LEVELS.map(([, n]) => `- ${n}：${ROAST_INFO[n].range}（${ROAST_INFO[n].depth}・${ROAST_INFO[n].taste}）`).join('\n')}
 
 【生豆】
-${line('名前', bean.name)}${line('産地', [bean.country, bean.region, bean.farm].filter(Boolean).join(' '))}${line('品種', bean.variety)}${line('等級', bean.grade)}${line('精製方法', bean.process)}${line('購入先', bean.shop)}${line('メモ', bean.memo)}
-【この豆の過去の焙煎（新しい順）】
+${line('名前', bean.name)}${line('産地', [bean.country, bean.region, bean.farm].filter(Boolean).join(' '))}${line('品種', bean.variety)}${line('等級', bean.grade)}${line('精製方法', bean.process)}${line('メモ', bean.memo)}
+【仕入れ（同じ豆でも、買うたびに収穫年や状態がちがうことがあります）】
+${purchasesOf(bean).length ? purchasesOf(bean).map((p, i) => `- ${i === 0 ? '★今回使う予定 ' : ''}${purchaseLabel(p)}${p.qtyKg ? `・${p.qtyKg}kg` : ''}${p.memo ? `／${p.memo}` : ''}`).join('\n') : '- 登録なし'}
+
+【この豆の過去の焙煎（新しい順。どの仕入れの豆かも書いてあります）】
 ${mine.length ? mine.map(x => roastDigest(x, true)).join('\n') : '- まだありません（はじめて焼く豆です）'}
 ${others.length ? `\n【ほかの豆の最近の焙煎（IRUBOのくせの参考）】\n${others.map(x => `${roastDigest(x, false)}（${beanName(x.beanId)}）`).join('\n')}\n` : ''}
 答えてほしいこと：
@@ -1389,6 +1507,7 @@ function editRoast(id) {
     r.aiTarget = first || null;
   }
   let aiTarget = r.aiTarget || null;  // 選んだAIの案（目標の数字と今回のポイント）
+  if (isNew && !draft && !r.purchaseId) r.purchaseId = purchasesOf(data.beans.find(x => x.id === r.beanId))[0]?.id || null;
   if (!r.temps?.length && r.chargeTemp != null) r.temps = [r.chargeTemp];
   r.temps = r.temps || [];
   r.ops = r.ops || [];
@@ -1420,6 +1539,9 @@ function editRoast(id) {
           </select>
           ${data.beans.length ? '' : '<div class="hint">先に「🫘 生豆」で豆を登録してください</div>'}
         </div>
+        <div class="field"><label>仕入れ（どの時に買った豆か）</label>
+          <select name="purchaseId"></select>
+          <div class="hint" id="purchaseHint"></div></div>
         <div class="field"><label>目指す焙煎度</label>
           <div class="recommend" id="recommend"></div>
           <select name="targetLevel"><option value="">選ばない</option>${ROAST_LEVELS.map(([, n]) => `<option value="${n}" ${r.targetLevel === n ? 'selected' : ''}>${n}（${ROAST_INFO[n].range}）</option>`).join('')}</select>
@@ -1509,6 +1631,7 @@ function editRoast(id) {
       ...r,
       date: f.date.value || todayIso(),
       beanId: f.beanId.value,
+      purchaseId: f.purchaseId.value || null,
       targetLevel: f.targetLevel.value,
       aiTarget: aiTarget && aiTarget.level === f.targetLevel.value ? aiTarget : null,
       greenG: num(f.greenG.value),
@@ -1617,6 +1740,23 @@ function editRoast(id) {
   });
   form.addEventListener('input', autoKeptG);
   form.addEventListener('input', autoInG);
+  // 仕入れの選択肢を、選んだ豆に合わせる
+  const fillPurchases = (beanId, selected) => {
+    const list = purchasesOf(data.beans.find(x => x.id === beanId));
+    const sel = form.elements.purchaseId;
+    sel.innerHTML = list.length
+      ? list.map(p => `<option value="${p.id}" ${p.id === selected ? 'selected' : ''}>${esc(purchaseLabel(p))}</option>`).join('')
+      : '<option value="">（仕入れの登録なし）</option>';
+    main.querySelector('#purchaseHint').textContent = list.length
+      ? 'いちばん上が、いちばん新しい仕入れです'
+      : '「🫘 生豆」で仕入れ（購入日・値段）を登録すると、原価が出ます';
+  };
+  fillPurchases(r.beanId, r.purchaseId);
+  form.addEventListener('change', e => {
+    if (e.target.name === 'beanId') {
+      fillPurchases(e.target.value, purchasesOf(data.beans.find(x => x.id === e.target.value))[0]?.id);
+    }
+  });
   form.addEventListener('change', e => {
     if (e.target.name === 'beanId') {
       const b = data.beans.find(x => x.id === e.target.value);
@@ -2241,14 +2381,16 @@ function renderBeans() {
   }
   for (const b of data.beans) {
     const n = data.roasts.filter(r => r.beanId === b.id).length;
-    const sub = [b.country, b.region, b.process, b.shop].filter(Boolean).map(esc).join('・');
+    const latest = purchasesOf(b)[0];
+    const sub = [b.country, b.region, b.process, latest?.shop].filter(Boolean).map(esc).join('・');
     html += `
       <button class="card" data-bean="${b.id}">
         <div class="row">
           <div class="name">${esc(b.name)}</div>
-          ${b.pricePerKg ? `<span class="big">${Number(b.pricePerKg).toLocaleString()}<small style="font-size:12px">円/kg</small></span>` : ''}
+          ${latest?.pricePerKg ? `<span class="big">${Number(latest.pricePerKg).toLocaleString()}<small style="font-size:12px">円/kg</small></span>` : ''}
         </div>
-        <div class="sub">${sub || '産地などは未入力'}・焙煎 ${n}回</div>
+        <div class="sub">${sub || '産地などは未入力'}・焙煎 ${n}回・仕入れ ${(b.purchases || []).length}回</div>
+        ${latest && purchaseStockText(latest) ? `<div class="sub">いちばん新しい仕入れ：${esc(purchaseStockText(latest))}</div>` : ''}
         ${(() => {
           const last = data.roasts.filter(r => r.beanId === b.id && !roastCost(r).missing).sort((x, y) => y.date.localeCompare(x.date))[0];
           return last ? `<div class="sub">焙煎豆100gあたり <b>${yenOf(roastCost(last).per100)}</b>（${esc(last.lot)}）</div>` : '';
@@ -2271,9 +2413,6 @@ const BEAN_FIELDS = [
   ['variety', '品種', 'text', '例：在来種'],
   ['grade', '等級', 'text', '例：G1、AA'],
   ['process', '精製方法', 'select', ''],
-  ['shop', '購入先', 'text', ''],
-  ['purchaseDate', '購入日', 'date', ''],
-  ['pricePerKg', '1kgあたりの値段（円・税込）', 'number', '例：3200'],
   ['memo', 'メモ', 'textarea', '販売店の説明や味の特徴など'],
 ];
 
@@ -2300,8 +2439,16 @@ function editBean(id) {
   main.innerHTML = `
     <form class="card" id="beanForm">
       ${BEAN_FIELDS.map(fieldHtml).join('')}
+      ${isNew ? `
+        <h2 style="margin-top:20px">最初の仕入れ</h2>
+        <div class="field"><label>購入日</label><input name="pDate" type="date" value="${todayIso()}"></div>
+        <div class="field"><label>購入先</label><input name="pShop" placeholder="例：○○珈琲"></div>
+        <div class="field"><label>1kgあたりの値段（円・税込）</label><div class="inline"><input name="pPrice" inputmode="numeric" placeholder="例：3200"><span class="unit">円/kg</span></div></div>
+        <div class="field"><label>買った量</label><div class="inline"><input name="pQty" inputmode="decimal" placeholder="例：1"><span class="unit">kg</span></div></div>
+        <div class="field"><label>メモ（収穫年・ロット番号など）</label><input name="pMemo"></div>` : ''}
     </form>
     <button class="btn primary" id="saveBean">保存する</button>
+    ${isNew ? '' : purchasesHtml(bean)}
     ${isNew ? '' : `<button class="btn danger" id="delBean">${used ? `この豆は${used}回の焙煎で使われているので消せません` : 'この生豆を消す'}</button>`}`;
 
   main.querySelector('#saveBean').addEventListener('click', () => {
@@ -2318,6 +2465,11 @@ function editBean(id) {
     }
     if (isNew) {
       next.id = newId();
+      const f = form.elements;
+      next.purchases = [];
+      if (f.pPrice.value.trim() || f.pShop.value.trim() || f.pQty.value.trim()) {
+        next.purchases.push({ id: newId(), date: f.pDate.value, shop: f.pShop.value.trim(), pricePerKg: num(f.pPrice.value), qtyKg: num(f.pQty.value), memo: f.pMemo.value.trim() });
+      }
       data.beans.push(next);
     } else {
       data.beans[data.beans.findIndex(b => b.id === bean.id)] = next;
@@ -2326,6 +2478,9 @@ function editBean(id) {
     toast('保存しました');
     showTab('beans');
   });
+
+  main.querySelector('#addPurchase')?.addEventListener('click', () => editPurchase(bean.id));
+  main.querySelectorAll('[data-purchase]').forEach(el => el.addEventListener('click', () => editPurchase(bean.id, el.dataset.purchase)));
 
   main.querySelector('#delBean')?.addEventListener('click', () => {
     if (used) return;
