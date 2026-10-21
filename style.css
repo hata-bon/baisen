@@ -306,3 +306,24 @@ textarea:focus { outline: 2px solid var(--brand); border-color: transparent; }
 /* hidden を付けたものは、見た目の指定より優先して隠す */
 [hidden] { display: none !important; }
 .btn.voice.paused, .tv-mic.paused { background: #e8a33a; border-color: #e8a33a; color: #fff; }
+
+/* ---------- AIの焙煎度の案 ---------- */
+.opts { display: flex; flex-direction: column; gap: 8px; margin: 8px 0; }
+.opt {
+  display: flex; flex-direction: column; gap: 3px; text-align: left; width: 100%;
+  background: #fff; border: 2px solid var(--line); border-radius: 12px; padding: 10px 12px;
+  font: inherit; color: var(--text);
+}
+.opt.on { border-color: var(--brand); box-shadow: 0 0 0 2px var(--brand-soft); }
+.opt-head { font-size: 14px; color: var(--brand); }
+.opt-head b { font-size: 17px; }
+.opt.on .opt-head::before { content: '✓ '; font-weight: 800; }
+.opt-taste { font-size: 13px; }
+.opt-plan { font-size: 12px; color: var(--brand); font-weight: 700; }
+.opt-why { font-size: 12px; color: var(--muted); }
+.opt-tip, .tip { font-size: 12px; color: #8a5a00; background: #fff6e0; border-radius: 8px; padding: 6px 8px; margin-top: 4px; }
+.opt-actions { display: flex; gap: 8px; margin-top: 6px; }
+.mini { flex: 1; border: 1px solid var(--brand); background: #fff; color: var(--brand); border-radius: 99px; padding: 8px; font-size: 13px; font-weight: 600; }
+.btn.ai-levels { margin-top: 10px; }
+.recommend details { margin-top: 6px; }
+.recommend summary { cursor: pointer; font-weight: 600; }

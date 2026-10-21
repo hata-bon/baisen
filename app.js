@@ -383,13 +383,27 @@ function targetPlan(r) {
     sec: Math.round((average(secs) ?? BASE_FIRST_CRACK.sec) / 10) * 10,
     temp: Math.round(average(temps) ?? BASE_FIRST_CRACK.temp),
   };
-  const basis = secs.length ? `この豆の過去${secs.length}回の平均` : '一般的な目安';
+  let basis = secs.length ? `この豆の過去${secs.length}回の平均` : '一般的な目安';
 
-  const [dev, dropTemp] = DEVELOP[level];
-  const drop = { sec: fc.sec + dev, temp: Math.max(dropTemp, fc.temp + 6) };
+  const [devDefault, dropTemp] = DEVELOP[level];
+  let drop = { sec: fc.sec + devDefault, temp: Math.max(dropTemp, fc.temp + 6) };
+
+  // AIの案を選んでいれば、その目標（1ハゼ・煎り止め・投入温度）を使う
+  const ai = r.aiTarget && r.aiTarget.level === level ? r.aiTarget : null;
+  if (ai?.fc?.sec != null) {
+    fc.sec = ai.fc.sec;
+    if (ai.fc.temp != null) fc.temp = ai.fc.temp;
+    basis = 'AIの案';
+  }
+  if (ai?.drop?.sec != null && ai.drop.sec > fc.sec) {
+    drop = { sec: ai.drop.sec, temp: ai.drop.temp ?? drop.temp };
+  } else if (ai) {
+    drop = { sec: fc.sec + devDefault, temp: drop.temp };
+  }
+  const dev = drop.sec - fc.sec;
 
   // 温度の上がり方：投入 →（予熱ありなら）底 → 1ハゼ まではだんだん上がり方がゆるやかに、1ハゼ → 煎り止めはまっすぐ
-  const start = num(r.temps?.[0]) ?? (r.preheat ? 180 : 25);
+  const start = num(r.temps?.[0]) ?? ai?.charge ?? (r.preheat ? 180 : 25);
   const bottom = r.preheat
     ? (r.turning?.sec != null && r.turning?.temp != null ? r.turning : bottomFromTemps(r.temps) || { sec: 90, temp: Math.round(start * 0.65) })
     : { sec: 0, temp: start };
@@ -409,11 +423,11 @@ function targetPlan(r) {
   for (let s = 0; s < drop.sec; s += 15) points.push([s, tempAt(s)]);
   points.push([drop.sec, drop.temp]);
 
-  return { level, fc, drop, dev, basis, points };
+  return { level, fc, drop, dev, basis, points, tip: ai?.tip || '', charge: ai?.charge ?? null };
 }
 
 function planText(plan) {
-  return `1ハゼ <b>${fmtTime(plan.fc.sec)}・${plan.fc.temp}℃</b>（${plan.basis}）→ 煎り止め <b>${fmtTime(plan.drop.sec)}・${plan.drop.temp}℃</b>（1ハゼから${fmtTime(plan.dev)}）／減り率の目安 ${lossRange(plan.level)}`;
+  return `${plan.charge ? `投入 <b>${plan.charge}℃</b> → ` : ''}1ハゼ <b>${fmtTime(plan.fc.sec)}・${plan.fc.temp}℃</b>（${plan.basis}）→ 煎り止め <b>${fmtTime(plan.drop.sec)}・${plan.drop.temp}℃</b>（1ハゼから${fmtTime(plan.dev)}）／減り率の目安 ${lossRange(plan.level)}${plan.tip ? `<div class="tip">💡 今回のポイント：${esc(plan.tip)}</div>` : ''}`;
 }
 
 // 紙の焙煎シートの「赤い帯」：[分, 下の温度, 上の温度]。黄色の列（煎り止めの目安）は13〜15分
@@ -589,7 +603,7 @@ function showRoast(id) {
       opt('量った生豆', r.greenG != null ? g(r.greenG) : null),
       opt('ハンドピック（前）', r.pickBeforeG != null ? `${g(r.pickBeforeG)} 除いた` : null),
       ['投入量', g(r.inG)],
-      opt('目指した焙煎度', esc(r.targetLevel)),
+      opt('目指した焙煎度', r.targetLevel ? `${esc(r.targetLevel)}${r.aiTarget?.label ? `（AIの案：${esc(r.aiTarget.label)}）` : ''}${r.aiTarget?.tip ? `<div class="hint">💡 ${esc(r.aiTarget.tip)}</div>` : ''}` : ''),
       ['予熱して投入', r.preheat ? `あり${r.chargeTemp ? `（約${r.chargeTemp}℃）` : ''}` : 'なし'],
       opt('気温・天気', [r.airTemp != null ? `${r.airTemp}℃` : '', r.weather].filter(Boolean).join('・')),
     ])}</div>
@@ -1088,6 +1102,159 @@ function aiReviewHtml(r) {
     </div>`;
 }
 
+// ---------- 焙煎度の案をAIに出してもらう（Claudeアプリに渡す） ----------
+// その豆の過去の焙煎・味見・AIの評価をくわしく渡して、2〜3案と、具体的な目標（投入温度・1ハゼ・煎り止め）、
+// 前回からの改善点を返してもらう。答えは豆ごとに覚えておく（bean.aiLevels）
+
+const LEVELS_START = '【焙煎度の案】', LEVELS_END = '【ここまで】';
+
+function clockText(sec) {
+  return sec == null ? '' : `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
+}
+
+// ある焙煎の記録を、AIに渡す文章にする
+function roastDigest(x, detail) {
+  const l = lossRate(x);
+  const ev = e => (e && (e.sec != null || e.temp != null || e.text) ? fmtEvent(e).replace(/<[^>]+>/g, '') : '');
+  const parts = [
+    `${x.date}（ロット${x.lot}）`,
+    x.inG != null ? `投入${x.inG}g` : '',
+    x.preheat ? `予熱あり${x.chargeTemp != null ? `・投入温度${x.chargeTemp}℃` : ''}` : '予熱なし',
+    x.targetLevel ? `目指した焙煎度：${x.targetLevel}` : '',
+    ev(x.turning) ? `底 ${ev(x.turning)}` : '',
+    ev(x.firstCrack) ? `1ハゼ ${ev(x.firstCrack)}` : '',
+    ev(x.secondCrack) ? `2ハゼ ${ev(x.secondCrack)}` : '',
+    ev(x.drop) ? `煎り止め ${ev(x.drop)}` : '',
+    l != null ? `減り率${l.toFixed(1)}%（目安「${roastLevel(l)}」）` : '',
+    x.level || x.noteLevel ? `焙煎度（自分の判断）：${x.level || x.noteLevel}` : '',
+  ].filter(Boolean);
+  let text = `- ${parts.join('／')}`;
+  if (!detail) {
+    const t = latestTasting(x);
+    return text + (t?.total ? `／味見の総合${t.total}/5` : '');
+  }
+  const temps = (x.temps || []).map((t, i) => (t == null ? null : `${i}分${t}`)).filter(Boolean).join(' ');
+  if (temps) text += `\n  1分ごとの温度（℃）：${temps}`;
+  if (x.heat || x.rotation) text += `\n  火力：${x.heat || '―'}／回転：${x.rotation || '―'}`;
+  if (x.ops?.length) text += `\n  途中の操作：${x.ops.map(o => `${o.sec != null ? fmtTime(o.sec) : ''} ${o.text}`).join('、')}`;
+  if (x.aiTarget?.tip) text += `\n  このときの改善のねらい：${x.aiTarget.tip}`;
+  if (x.color || x.unevenness) text += `\n  見た目：${[x.color, x.unevenness].filter(Boolean).join('・')}`;
+  if (x.memo) text += `\n  メモ：${x.memo}`;
+  for (const t of x.tastings || []) {
+    const scores = TASTE_ITEMS.map(([k, label]) => (t[k] ? `${label}${t[k]}` : '')).filter(Boolean).join('・');
+    text += `\n  味見（焙煎から${daysAfter(x.date, t.date)}日目）：${scores}／総合${t.total || '―'}/5${t.memo ? `／「${t.memo}」` : ''}`;
+  }
+  if (x.aiReview?.text) text += `\n  AIの評価（抜粋）：${x.aiReview.text.replace(/\s+/g, ' ').slice(0, 400)}`;
+  return text;
+}
+
+function aiLevelsPrompt(bean) {
+  const mine = data.roasts.filter(x => x.beanId === bean.id).sort((a, b) => b.date.localeCompare(a.date)).slice(0, 8);
+  const others = data.roasts.filter(x => x.beanId !== bean.id).sort((a, b) => b.date.localeCompare(a.date)).slice(0, 5);
+  const line = (k, v) => (v == null || v === '' ? '' : `- ${k}：${v}\n`);
+  return `あなたはコーヒー焙煎にくわしい先生です。これから焙煎する豆について、目指す焙煎度の案を2〜3つ出してください。
+過去の焙煎記録をよく見て、うまくいったこと・うまくいかなかったことを、今回の焙煎の改善に生かしてください。
+
+【焙煎機と使い方】
+- IRUBO（カセットコンロの直火 × USBで自動回転するカゴ、デジタル温度計つき、1回100〜400g）
+- 温度は IRUBO の温度計の表示で、豆そのものの温度より低めに出ます
+- 2026年2月からは、予熱してから豆を投入しています（温度がいったん下がって底を打つ）
+- 焼いた豆は、カフェのドリップコーヒーに使います
+
+【このアプリで使う焙煎度の名前と減り率の目安】（案の焙煎度は、必ずこの中の名前で）
+${ROAST_LEVELS.map(([, n]) => `- ${n}：${ROAST_INFO[n].range}（${ROAST_INFO[n].depth}・${ROAST_INFO[n].taste}）`).join('\n')}
+
+【生豆】
+${line('名前', bean.name)}${line('産地', [bean.country, bean.region, bean.farm].filter(Boolean).join(' '))}${line('品種', bean.variety)}${line('等級', bean.grade)}${line('精製方法', bean.process)}${line('購入先', bean.shop)}${line('メモ', bean.memo)}
+【この豆の過去の焙煎（新しい順）】
+${mine.length ? mine.map(x => roastDigest(x, true)).join('\n') : '- まだありません（はじめて焼く豆です）'}
+${others.length ? `\n【ほかの豆の最近の焙煎（IRUBOのくせの参考）】\n${others.map(x => `${roastDigest(x, false)}（${beanName(x.beanId)}）`).join('\n')}\n` : ''}
+答えてほしいこと：
+1. 過去の焙煎から見えること（うまくいった点・課題）を3行くらいで
+2. 目指す焙煎度の案を2〜3つ。いちばんのおすすめを案1に。
+   アプリで読み取れるように、案だけを「${LEVELS_START}」の次の行から「${LEVELS_END}」の前の行まで、下の形でそのまま書いてください（数字は半角、時刻は 分:秒）。
+
+${LEVELS_START}
+案1：ハイ
+ねらい：（10字くらい。例：香りを生かす王道）
+味：（どんな味になるか、30字くらい）
+理由：（この豆と過去の記録から、50字くらい）
+投入温度：185
+1ハゼ：8:30／175
+煎り止め：10:00／193
+前回からの改善：（具体的に。例：前回は1ハゼが遅れたので投入温度を10℃上げる。はじめての豆なら、気をつけること）
+案2：…（同じ形）
+${LEVELS_END}
+
+3. そのほか、焙煎中に気をつけることがあれば最後に
+`;
+}
+
+// 「8:30」「8分30秒」→ 秒
+function parseClock(text) {
+  const m = String(text || '').replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).match(/(\d+)\s*[:：分]\s*(\d{1,2})?/);
+  return m ? Number(m[1]) * 60 + Number(m[2] || 0) : null;
+}
+
+// 「シティロースト」「フルシティ（深煎り）」なども、アプリの名前にそろえる
+function normalizeLevel(text) {
+  const t = String(text || '').replace(/ロースト|\s/g, '');
+  return [...ROAST_LEVELS.map(([, n]) => n)].sort((a, b) => b.length - a.length).find(n => t.includes(n)) || null;
+}
+
+function parseAiLevels(text) {
+  const all = String(text || '').replace(/\r/g, '');
+  const a = all.indexOf(LEVELS_START), b = all.indexOf(LEVELS_END, a + 1);
+  const body = a >= 0 ? all.slice(a + LEVELS_START.length, b > a ? b : undefined) : all;
+  const blocks = body.split(/(?=案\s*[0-9０-９]\s*[：:])/).filter(x => /^案\s*[0-9０-９]/.test(x.trim()));
+  const field = (blk, label) => blk.match(new RegExp(`${label}\\s*[：:]\\s*(.+)`))?.[1]?.replace(/\*+/g, '').trim() || '';
+  const options = blocks.map(blk => {
+    const level = normalizeLevel(blk.match(/案\s*[0-9０-９]\s*[：:]\s*(.+)/)?.[1]);
+    if (!level) return null;
+    const pair = v => {
+      const [time, temp] = v.split(/[／/・,，、]/);
+      return { sec: parseClock(time), temp: num(temp?.replace(/[^\d.]/g, '')) };
+    };
+    const fc = pair(field(blk, '1ハゼ')), drop = pair(field(blk, '煎り止め'));
+    return {
+      level,
+      label: field(blk, 'ねらい'),
+      taste: field(blk, '味'),
+      why: field(blk, '理由'),
+      charge: num(field(blk, '投入温度').replace(/[^\d.]/g, '')),
+      fc: fc.sec != null ? fc : null,
+      drop: drop.sec != null ? drop : null,
+      tip: field(blk, '前回からの改善'),
+    };
+  }).filter(Boolean).slice(0, 3);
+  if (!options.length) return null;
+  const summary = (a > 0 ? all.slice(0, a) : '').replace(/^[#\s]+/gm, '').trim();
+  return { options, summary, text: all, date: todayIso() };
+}
+
+async function askAiLevels(bean) {
+  return shareToClaude({ photoIds: [], lot: '' }, aiLevelsPrompt(bean), `焙煎度の案 ${bean.name}`);
+}
+
+// 貼り付けた答えを読み取って、豆に覚えさせる。読めたら true
+async function pasteAiLevels(bean) {
+  let text = '';
+  try { text = await navigator.clipboard.readText(); } catch (e) { /* 読めなければ手で貼ってもらう */ }
+  let parsed = parseAiLevels(text);
+  if (!parsed) {
+    text = prompt('Claudeの答えを、ここに貼り付けてください') || '';
+    parsed = parseAiLevels(text);
+  }
+  if (!parsed) {
+    if (text) toast('案が読み取れませんでした。「【焙煎度の案】」の部分が入っているか確かめてください');
+    return false;
+  }
+  bean.aiLevels = parsed;
+  save();
+  toast(`AIの案を${parsed.options.length}つ読み取りました`);
+  return true;
+}
+
 // ---------- 焙煎タイマーの道具 ----------
 
 let closeTimerView = null;  // タイマーの画面が開いているときの「閉じる」
@@ -1215,7 +1382,13 @@ function editRoast(id) {
     temps: [],
     ops: [],
   });
-  if (isNew && !draft) r.targetLevel = recommendLevel(data.beans.find(b => b.id === r.beanId))?.level || '';
+  if (isNew && !draft) {
+    const b = data.beans.find(x => x.id === r.beanId);
+    const first = b?.aiLevels?.options?.[0];
+    r.targetLevel = first?.level || recommendLevel(b)?.level || '';
+    r.aiTarget = first || null;
+  }
+  let aiTarget = r.aiTarget || null;  // 選んだAIの案（目標の数字と今回のポイント）
   if (!r.temps?.length && r.chargeTemp != null) r.temps = [r.chargeTemp];
   r.temps = r.temps || [];
   r.ops = r.ops || [];
@@ -1337,6 +1510,7 @@ function editRoast(id) {
       date: f.date.value || todayIso(),
       beanId: f.beanId.value,
       targetLevel: f.targetLevel.value,
+      aiTarget: aiTarget && aiTarget.level === f.targetLevel.value ? aiTarget : null,
       greenG: num(f.greenG.value),
       inG: num(f.inG.value),
       pickBeforeG: num(f.pickBeforeG.value),
@@ -1383,9 +1557,34 @@ function editRoast(id) {
       const name = x.level || x.noteLevel || roastLevel(l);
       return `${x.date.slice(2).replace(/-/g, '/')} 減り率${l == null ? '―' : l.toFixed(1) + '%'}${name ? `（${esc(name)}）` : ''}`;
     });
-    main.querySelector('#recommend').innerHTML = rec
-      ? `<div>おすすめは <b>${rec.level}</b></div><div class="why">${rec.reason}</div>${past.length ? `<div class="why">この豆の最近の焙煎：${past.join('、')}</div>` : ''}`
-      : '<div class="why">生豆を選ぶと、おすすめの焙煎度が出ます</div>';
+    const ai = bean?.aiLevels;
+    const box = main.querySelector('#recommend');
+    if (!bean) {
+      box.innerHTML = '<div class="why">生豆を選ぶと、おすすめの焙煎度が出ます</div>';
+    } else if (ai) {
+      box.innerHTML = `
+        <div>🤖 AIの案（${fmtDate(ai.date)}）</div>
+        <div class="opts">${ai.options.map((o, i) => `
+          <button type="button" class="opt ${now.targetLevel === o.level && aiTarget?.level === o.level ? 'on' : ''}" data-opt="${i}">
+            <span class="opt-head"><b>${esc(o.level)}</b>${o.label ? `　${esc(o.label)}` : ''}</span>
+            ${o.taste ? `<span class="opt-taste">${esc(o.taste)}</span>` : ''}
+            <span class="opt-plan">${[o.charge ? `投入${o.charge}℃` : '', o.fc ? `1ハゼ${clockText(o.fc.sec)}${o.fc.temp ? `・${o.fc.temp}℃` : ''}` : '', o.drop ? `煎り止め${clockText(o.drop.sec)}${o.drop.temp ? `・${o.drop.temp}℃` : ''}` : ''].filter(Boolean).join(' → ')}</span>
+            ${o.why ? `<span class="opt-why">${esc(o.why)}</span>` : ''}
+            ${o.tip ? `<span class="opt-tip">💡 ${esc(o.tip)}</span>` : ''}
+          </button>`).join('')}</div>
+        ${ai.summary ? `<details class="why"><summary>過去の焙煎から見えること</summary>${esc(ai.summary).replace(/\n/g, '<br>')}</details>` : ''}
+        <div class="opt-actions">
+          <button type="button" class="mini" data-ai="ask">🤖 もう一度AIに聞く</button>
+          <button type="button" class="mini" data-ai="paste">📋 答えを貼り付け</button>
+        </div>`;
+    } else {
+      box.innerHTML = `
+        <div>おすすめは <b>${rec.level}</b>（産地と精製方法からの目安）</div><div class="why">${rec.reason}</div>
+        ${past.length ? `<div class="why">この豆の最近の焙煎：${past.join('、')}</div>` : ''}
+        <button type="button" class="btn primary ai-levels" data-ai="ask">🤖 AIに焙煎度の案を出してもらう</button>
+        <div class="why">過去の焙煎記録を見て、2〜3案と改善点を出してもらいます。共有画面で「Claude」→「新規セッション」を選んで送り、答えをコピーしたら下を押してください</div>
+        <button type="button" class="btn ghost" data-ai="paste">📋 Claudeの答えを貼り付け</button>`;
+    }
     const plan = targetPlan(now);
     main.querySelector('#chartBox').innerHTML = curveSvg(now, plan) + (plan
       ? `<div class="note plan-text">目標：${planText(plan)}</div>`
@@ -1419,9 +1618,37 @@ function editRoast(id) {
   form.addEventListener('input', autoKeptG);
   form.addEventListener('input', autoInG);
   form.addEventListener('change', e => {
-    if (e.target.name !== 'beanId') return;
-    const rec = recommendLevel(data.beans.find(b => b.id === e.target.value));
-    if (rec) form.elements.targetLevel.value = rec.level;
+    if (e.target.name === 'beanId') {
+      const b = data.beans.find(x => x.id === e.target.value);
+      const first = b?.aiLevels?.options?.[0];
+      aiTarget = first || null;
+      const level = first?.level || recommendLevel(b)?.level;
+      if (level) form.elements.targetLevel.value = level;
+    }
+    if (e.target.name === 'targetLevel') {
+      // 手で選び直したときは、同じ焙煎度のAIの案があればそれを使う
+      const b = data.beans.find(x => x.id === form.elements.beanId.value);
+      aiTarget = b?.aiLevels?.options?.find(o => o.level === e.target.value) || null;
+    }
+  });
+  main.querySelector('#recommend').addEventListener('click', async e => {
+    const opt = e.target.closest('[data-opt]');
+    const act = e.target.closest('[data-ai]');
+    const bean = data.beans.find(x => x.id === form.elements.beanId.value);
+    if (!bean) return;
+    if (opt) {
+      aiTarget = bean.aiLevels.options[Number(opt.dataset.opt)];
+      form.elements.targetLevel.value = aiTarget.level;
+      remember();
+    } else if (act?.dataset.ai === 'ask') {
+      askAiLevels(bean);
+    } else if (act?.dataset.ai === 'paste') {
+      if (await pasteAiLevels(bean)) {
+        aiTarget = bean.aiLevels.options[0];
+        form.elements.targetLevel.value = aiTarget.level;
+        remember();
+      }
+    }
   });
   form.addEventListener('input', remember);
   form.addEventListener('change', remember);
@@ -1653,7 +1880,7 @@ function editRoast(id) {
           diff = `<div class="tv-diff ${d > 3 ? 'hi' : d < -3 ? 'lo' : 'ok'}">${last}分：目標より ${d > 0 ? '+' : ''}${d}℃${d > 3 ? '（進んでいる）' : d < -3 ? '（遅れている）' : '（ほぼ目標どおり）'}</div>`;
         }
       }
-      return `目標：1ハゼ <b>${fmtTime(plan.fc.sec)}・${plan.fc.temp}℃</b> → 煎り止め <b>${fmtTime(plan.drop.sec)}・${plan.drop.temp}℃</b>${diff}`;
+      return `目標：1ハゼ <b>${fmtTime(plan.fc.sec)}・${plan.fc.temp}℃</b> → 煎り止め <b>${fmtTime(plan.drop.sec)}・${plan.drop.temp}℃</b>${diff}${plan.tip ? `<div class="tip">💡 ${esc(plan.tip)}</div>` : ''}`;
     };
 
     let lastMinute = Math.floor(elapsed() / 60);
